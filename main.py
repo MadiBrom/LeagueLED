@@ -103,7 +103,6 @@ def prep_health_for_ocr(health_bgra):
     health_bgr = bgra_to_bgr(focus)
     gray = bgr_to_gray(health_bgr)
 
-    # Match the proven hpdebug preprocessing to reduce variation.
     gray = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_LINEAR)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
     _, bw = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
@@ -125,7 +124,6 @@ def parse_hp_flexible(txt, last_max):
         mx = int(m.group(2))
         return cur, mx
 
-    # fallback: any 2-4 digit chunk (ignore stray slashes/zeros)
     m2 = re.search(r"(\d{2,4})", txt)
     if m2:
         cur = int(m2.group(1))
@@ -157,11 +155,9 @@ def accept_hp_reading(cur, mx, last_hp):
     cur = min(cur, mx)
 
     if last_max > 0:
-        # Reject OCR spikes that change max HP wildly (e.g., 2329 -> 9329).
         if mx > last_max * 1.35 or mx < last_max * 0.65:
             return False, cur, mx
 
-        # Reject huge single-frame jumps in current HP.
         jump_cap = max(50, int(last_max * 0.6))
         if abs(cur - last_cur) > jump_cap:
             return False, cur, mx
@@ -203,7 +199,6 @@ def color_from_permille(permille, dead_now):
         return (255, 0, 0)
 
     hp = clamp_int(permille, 0, 1000) / 1000.0
-    # Hue sweep: 120 (green) at full HP -> 0 (red) at 0 HP, vivid colors.
     hue = 120.0 * hp
     return hsv_to_rgb(hue, 1.0, 1.0)
 
@@ -220,7 +215,6 @@ def load_crop_config():
         mon = int(data.get("monitor_index", MONITOR_INDEX))
         events = data.get("events_crop", EVENTS_CROP)
         health = data.get("health_crop", HEALTH_CROP)
-        # ensure required keys exist; fallback to defaults if malformed
         for key in ("top", "left", "width", "height"):
             if key not in events or key not in health:
                 raise ValueError("crop missing keys")
