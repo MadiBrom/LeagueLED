@@ -21,6 +21,9 @@ MONITOR_INDEX = 1
 
 EVENT_THRESHOLD = 0.8
 
+FULL_FRAMES_REQUIRED = 3
+FULL_SNAP_PERMILLE = 995
+
 SHOW_DEBUG_WINDOWS = True
 PRINT_OCR_DEBUG = True
 
@@ -306,6 +309,8 @@ def main():
     last_rgb = None
 
     objective_hold_until = 0.0
+
+    full_confirm = 0
 
     with mss.mss() as sct:
         while True:
