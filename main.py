@@ -191,6 +191,7 @@ def prep_health_for_ocr(health_bgra):
 
     if USE_THIN_DIGITS:
         mask = cv2.erode(mask, kernel, iterations=THIN_ITERATIONS)
+        mask = cv2.dilate(mask, kernel, iterations=1)
 
     return mask
 
@@ -236,11 +237,18 @@ def repair_dropped_digit(cur, mx, last_cur, last_max):
     if mx <= 0:
         return cur
 
+    s_cur = str(cur)
+
+    # Do NOT try to "repair" single digit reads.
+    # This preserves real death reads like 0/951,
+    # and real low hp like 5/951, 9/951, etc.
+    if len(s_cur) == 1:
+        return cur
+
     candidates = [cur]
 
     if last_cur > 0:
         s_last = str(last_cur)
-        s_cur = str(cur)
         if len(s_cur) < len(s_last):
             diff = len(s_last) - len(s_cur)
             if diff <= 2:
@@ -254,7 +262,6 @@ def repair_dropped_digit(cur, mx, last_cur, last_max):
 
     if last_max > 0:
         s_lastm = str(last_max)
-        s_cur = str(cur)
         if len(s_cur) < len(s_lastm):
             diff = len(s_lastm) - len(s_cur)
             if diff <= 2:
@@ -272,10 +279,42 @@ def repair_dropped_digit(cur, mx, last_cur, last_max):
         candidates.append(cur * 100)
 
     if last_cur > 0:
-        best = min(candidates, key=lambda c: abs(c - last_cur))
-        return best
+        return min(candidates, key=lambda c: abs(c - last_cur))
 
     return max(candidates)
+
+
+def repair_extra_digit(cur, mx, last_cur):
+    if mx <= 0:
+        return cur
+
+    candidates = [cur]
+
+    if cur // 10 <= mx:
+        candidates.append(cur // 10)
+    if cur // 100 <= mx:
+        candidates.append(cur // 100)
+
+    s = str(cur)
+    if len(s) > 1:
+        try:
+            candidates.append(int(s[1:]))
+        except Exception:
+            pass
+        try:
+            candidates.append(int(s[:-1]))
+        except Exception:
+            pass
+
+    if cur % 1000 <= mx:
+        candidates.append(cur % 1000)
+    if cur % 10000 <= mx:
+        candidates.append(cur % 10000)
+
+    if last_cur > 0:
+        return min(candidates, key=lambda c: abs(c - last_cur))
+
+    return min(candidates, key=lambda c: abs(mx - c))
 
 
 def clamp_int(v, low, high):
@@ -496,53 +535,62 @@ def main():
             health_bw = prep_health_for_ocr(health_bgra)
             healthTxt = ocr_health_text(health_bw)
 
-            glitch = is_ocr_glitch(healthTxt)
-            if glitch:
+            frame_ok = False
+            glitch = False
+
+            if is_ocr_glitch(healthTxt):
+                glitch = True
+            else:
+                parsed = parse_hp_flexible(healthTxt, good_hp[1])
+                if parsed is None:
+                    glitch = True
+                else:
+                    cur, mx, strong = parsed
+
+                    cur = repair_dropped_digit(cur, mx, good_hp[0], good_hp[1])
+
+                    if strong and mx > 0 and cur > mx:
+                        fixed = repair_extra_digit(cur, mx, good_hp[0])
+                        if fixed > mx:
+                            glitch = True
+                        else:
+                            cur = fixed
+
+                    if not glitch:
+                        ok, cur, mx, max_candidate, max_candidate_hits = accept_hp_reading(
+                            cur, mx, good_hp, strong, max_candidate, max_candidate_hits
+                        )
+
+                        if ok and mx > 0 and 0 <= cur <= mx:
+                            good_hp[0] = cur
+                            good_hp[1] = mx
+                            good_permille = int(cur * 1000 / mx)
+
+                            if strong and mx > 0 and cur == 0:
+                                dead_confirm += 1
+                                alive_confirm = 0
+                            elif mx > 0 and cur > 0:
+                                alive_confirm += 1
+                                dead_confirm = 0
+                            else:
+                                dead_confirm = 0
+                                alive_confirm = 0
+
+                            if strong and mx > 0 and good_permille >= FULL_SNAP_PERMILLE:
+                                full_confirm += 1
+                            else:
+                                full_confirm = 0
+
+                            frame_ok = True
+                        else:
+                            glitch = True
+
+            if not frame_ok:
                 ocr_lock_until = max(ocr_lock_until, now + OCR_GLITCH_HOLD_SEC)
                 if ocr_bad_since is None:
                     ocr_bad_since = now
             else:
                 ocr_bad_since = None
-
-            if not glitch:
-                parsed = parse_hp_flexible(healthTxt, good_hp[1])
-                if parsed is not None:
-                    cur, mx, strong = parsed
-
-                    cur = repair_dropped_digit(cur, mx, good_hp[0], good_hp[1])
-
-                    ok, cur, mx, max_candidate, max_candidate_hits = accept_hp_reading(
-                        cur, mx, good_hp, strong, max_candidate, max_candidate_hits
-                    )
-
-                    if ok:
-                        cur = max(0, cur)
-                        mx = max(0, mx)
-                        if mx > 0 and cur > mx:
-                            cur = mx
-
-                        good_hp[0] = cur
-                        good_hp[1] = mx
-
-                        if mx > 0:
-                            good_permille = int(cur * 1000 / mx)
-                        else:
-                            good_permille = 0
-
-                        if strong and mx > 0 and cur == 0:
-                            dead_confirm += 1
-                            alive_confirm = 0
-                        elif mx > 0 and cur > 0:
-                            alive_confirm += 1
-                            dead_confirm = 0
-                        else:
-                            dead_confirm = 0
-                            alive_confirm = 0
-
-                        if strong and mx > 0 and good_permille >= FULL_SNAP_PERMILLE:
-                            full_confirm += 1
-                        else:
-                            full_confirm = 0
 
             dead_now = was_dead
             if dead_confirm >= DEAD_FRAMES_REQUIRED:
