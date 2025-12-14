@@ -11,3 +11,5 @@ time.sleep(2)
 arduino.write(b"10,0,0,255.")
 time.sleep(2)
 arduino.write(b"10,0,0,0.")
+
+# blue, red, green, off

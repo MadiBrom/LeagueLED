@@ -11,9 +11,17 @@ import numpy as np
 import pytesseract
 import serial
 
+try:
+    from serial.tools import list_ports
+except Exception:
+    list_ports = None
+
+
+print("RUNNING:", Path(__file__).resolve())
 
 SERIAL_PORT = "COM3"
 SERIAL_BAUD = 9600
+AUTO_DETECT_SERIAL = True
 
 CONFIG_PATH = Path("crops.json")
 
@@ -21,11 +29,9 @@ MONITOR_INDEX = 1
 
 EVENT_THRESHOLD = 0.8
 
-FULL_FRAMES_REQUIRED = 3
-FULL_SNAP_PERMILLE = 995
-
 SHOW_DEBUG_WINDOWS = True
 PRINT_OCR_DEBUG = True
+DEBUG_PRINT_EVERY_SEC = 0.35
 
 HEALTH_FOCUS_X = (0.40, 0.62)
 HEALTH_FOCUS_Y = (0.32, 0.78)
@@ -34,8 +40,34 @@ EVENTS_CROP = {"top": 233, "left": 1550, "width": 160, "height": 292}
 HEALTH_CROP = {"top": 984, "left": 775, "width": 280, "height": 27}
 
 OBJECTIVE_HOLD_SEC = 3.6
+
 DEAD_FRAMES_REQUIRED = 4
 ALIVE_FRAMES_REQUIRED = 2
+
+FULL_FRAMES_REQUIRED = 3
+FULL_SNAP_PERMILLE = 995
+
+MAX_CANDIDATE_FRAMES_REQUIRED = 6
+
+USE_THIN_DIGITS = True
+THIN_ITERATIONS = 1
+
+HSV_WHITE_LOW = (0, 0, 160)
+HSV_WHITE_HIGH = (179, 80, 255)
+
+SOLID_COLOR_OPCODE = 10
+
+# Your Arduino test proved G and B are swapped on output.
+# So we send R, B, G instead of R, G, B.
+SWAP_GB_ON_SEND = True
+
+# New behavior for OCR glitches
+OCR_GLITCH_HOLD_SEC = 0.40
+OCR_FALLBACK_YELLOW_AFTER_SEC = 1.20
+FALLBACK_YELLOW_RGB = (255, 255, 0)
+
+# Reduce jitter around mid health colors
+COLOR_STEP_PERMILLE = 25
 
 TEMPLATES = {
     0: ("Baron", "template/baron.jpg"),
@@ -47,37 +79,76 @@ TEMPLATES = {
     6: ("Elder", "template/elder.jpg"),
 }
 
+TESSERACT_EXE = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+if not Path(TESSERACT_EXE).exists():
+    raise RuntimeError("Tesseract exe not found at: " + TESSERACT_EXE)
 
-def make_tesseract_path():
-    dash = chr(45)
-    base = r"C:\Program Files\Tesseract"
-    tail = r"OCR\tesseract.exe"
-    return base + dash + tail
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_EXE
+print("tesseract_cmd:", pytesseract.pytesseract.tesseract_cmd)
 
 
-pytesseract.pytesseract.tesseract_cmd = make_tesseract_path()
+def pick_serial_port(preferred):
+    if not AUTO_DETECT_SERIAL:
+        return preferred
+    if list_ports is None:
+        return preferred
+
+    ports = list(list_ports.comports())
+    if not ports:
+        return preferred
+
+    for p in ports:
+        desc = (p.description or "").lower()
+        if "arduino" in desc or "ch340" in desc or "usb serial" in desc:
+            return p.device
+
+    return ports[0].device
 
 
 def safe_serial_open():
+    port = pick_serial_port(SERIAL_PORT)
     try:
-        return serial.Serial(SERIAL_PORT, SERIAL_BAUD, timeout=1)
+        print("Serial trying:", port)
+        return serial.Serial(port, SERIAL_BAUD, timeout=1)
     except Exception as exc:
         print("Serial open failed:", exc)
         return None
 
 
+_last_serial_fail = 0.0
+
+
 def safe_serial_write(arduino, text):
+    global _last_serial_fail
     if arduino is None:
         return
     try:
         arduino.write(text.encode())
     except Exception as exc:
-        print("Serial write failed:", exc)
+        now = time.monotonic()
+        if now - _last_serial_fail > 1.0:
+            print("Serial write failed:", exc)
+            _last_serial_fail = now
 
 
-def build_region(monitor, crop, mon_index):
+def to_hw_rgb(rgb):
+    r, g, b = rgb
+    if SWAP_GB_ON_SEND:
+        return (r, b, g)
+    return (r, g, b)
+
+
+def send_color_cmd(arduino, opcode, rgb):
+    r, g, b = to_hw_rgb(rgb)
+    safe_serial_write(arduino, f"{int(opcode)},{int(r)},{int(g)},{int(b)}.")
+
+
+def send_still_color(arduino, rgb):
+    send_color_cmd(arduino, SOLID_COLOR_OPCODE, rgb)
+
+
+def build_region(monitor, crop):
     return {
-        "mon": mon_index,
         "top": monitor["top"] + crop["top"],
         "left": monitor["left"] + crop["left"],
         "width": crop["width"],
@@ -102,29 +173,46 @@ def prep_health_for_ocr(health_bgra):
     y2 = min(h, int(h * HEALTH_FOCUS_Y[1]))
     focus = health_bgra[y1:y2, x1:x2]
 
-    # keep top part only, helps avoid reading the second line
-    focus = focus[: int(focus.shape[0] * 0.60), :]
-
     health_bgr = bgra_to_bgr(focus)
-    gray = bgr_to_gray(health_bgr)
 
-    gray = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_LINEAR)
-    gray = cv2.GaussianBlur(gray, (3, 3), 0)
+    # Upscale for crisp OCR on tiny HUD digits
+    health_bgr = cv2.resize(
+        health_bgr, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_CUBIC
+    )
 
-    _, bw = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
+    # HSV white filter: keeps the digits, dumps the colored bar noise
+    hsv = cv2.cvtColor(health_bgr, cv2.COLOR_BGR2HSV)
+    lower = np.array(HSV_WHITE_LOW, dtype=np.uint8)
+    upper = np.array(HSV_WHITE_HIGH, dtype=np.uint8)
+    mask = cv2.inRange(hsv, lower, upper)
 
-    return bw
+    kernel = np.ones((2, 2), np.uint8)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=1)
+
+    if USE_THIN_DIGITS:
+        mask = cv2.erode(mask, kernel, iterations=THIN_ITERATIONS)
+
+    return mask
 
 
 def ocr_health_text(health_bw):
-    dash = chr(45)
     cfg = (
-        f"{dash}{dash}psm 7 "
-        f"{dash}c classify_bln_numeric_mode=1 "
-        f"{dash}c tessedit_char_whitelist=0123456789/"
+        "--oem 3 --psm 7 "
+        "-c tessedit_char_whitelist=0123456789/ "
+        "-c classify_bln_numeric_mode=1"
     )
     txt = pytesseract.image_to_string(health_bw, config=cfg)
     return txt.strip().replace(" ", "")
+
+
+def is_ocr_glitch(txt):
+    if not txt:
+        return True
+    if txt.count("/") != 1:
+        return True
+    if len(txt) > 10:
+        return True
+    return False
 
 
 def parse_hp_flexible(txt, last_max):
@@ -132,19 +220,62 @@ def parse_hp_flexible(txt, last_max):
     if m:
         cur = int(m.group(1))
         mx = int(m.group(2))
-        return cur, mx
+        return cur, mx, True
 
-    # fallback when slash vanishes, only accept if it is believable
     m2 = re.search(r"(\d{2,4})", txt)
     if m2:
         cur = int(m2.group(1))
         if last_max > 0:
-            if cur > last_max:
-                return None
-            return cur, last_max
-        return cur, cur
+            return cur, last_max, False
+        return cur, cur, False
 
     return None
+
+
+def repair_dropped_digit(cur, mx, last_cur, last_max):
+    if mx <= 0:
+        return cur
+
+    candidates = [cur]
+
+    if last_cur > 0:
+        s_last = str(last_cur)
+        s_cur = str(cur)
+        if len(s_cur) < len(s_last):
+            diff = len(s_last) - len(s_cur)
+            if diff <= 2:
+                try:
+                    pref = s_last[:diff]
+                    cand = int(pref + s_cur)
+                    if 0 <= cand <= mx:
+                        candidates.append(cand)
+                except Exception:
+                    pass
+
+    if last_max > 0:
+        s_lastm = str(last_max)
+        s_cur = str(cur)
+        if len(s_cur) < len(s_lastm):
+            diff = len(s_lastm) - len(s_cur)
+            if diff <= 2:
+                try:
+                    pref = s_lastm[:diff]
+                    cand = int(pref + s_cur)
+                    if 0 <= cand <= mx:
+                        candidates.append(cand)
+                except Exception:
+                    pass
+
+    if cur * 10 <= mx:
+        candidates.append(cur * 10)
+    if cur * 100 <= mx:
+        candidates.append(cur * 100)
+
+    if last_cur > 0:
+        best = min(candidates, key=lambda c: abs(c - last_cur))
+        return best
+
+    return max(candidates)
 
 
 def clamp_int(v, low, high):
@@ -155,30 +286,50 @@ def clamp_int(v, low, high):
     return v
 
 
-def quantize_permille(permille, step=25):
-    permille = clamp_int(permille, 0, 1000)
-    return int(round(permille / step) * step)
+def quantize_permille(permille, step):
+    permille = clamp_int(int(permille), 0, 1000)
+    return int(round(permille / float(step)) * step)
 
 
-def accept_hp_reading(cur, mx, last_hp):
+def accept_hp_reading(cur, mx, last_hp, strong, max_candidate, max_candidate_hits):
     last_cur, last_max = last_hp
 
     if mx <= 0:
-        return False, cur, mx
+        return False, cur, mx, max_candidate, max_candidate_hits
 
-    # hard reject impossible reads, do not clamp into full
-    if cur > mx:
-        return False, cur, mx
+    orig_cur = cur
+    cur = min(cur, mx)
+
+    # Critical: if we were in weak parse mode and OCR produced a number bigger than max,
+    # do not clamp it to max and accidentally go full green.
+    if not strong and orig_cur > mx:
+        return False, cur, mx, max_candidate, max_candidate_hits
+
+    if strong:
+        if mx < 200 or mx > 9999:
+            return False, cur, mx, max_candidate, max_candidate_hits
+
+        if last_max > 0:
+            ratio = mx / float(last_max)
+            if ratio > 1.35 or ratio < 0.65:
+                if max_candidate == mx:
+                    max_candidate_hits += 1
+                else:
+                    max_candidate = mx
+                    max_candidate_hits = 1
+
+                if max_candidate_hits >= MAX_CANDIDATE_FRAMES_REQUIRED:
+                    max_candidate_hits = 0
+                    return True, cur, mx, None, 0
+
+                return False, cur, mx, max_candidate, max_candidate_hits
 
     if last_max > 0:
-        if mx > last_max * 1.35 or mx < last_max * 0.65:
-            return False, cur, mx
-
         jump_cap = max(50, int(last_max * 0.6))
-        if abs(cur - last_cur) > jump_cap:
-            return False, cur, mx
+        if abs(cur - last_cur) > jump_cap and not strong:
+            return False, cur, mx, max_candidate, max_candidate_hits
 
-    return True, cur, mx
+    return True, cur, mx, None, 0
 
 
 def hsv_to_rgb(h, s, v):
@@ -210,27 +361,29 @@ def hsv_to_rgb(h, s, v):
     )
 
 
-def color_from_permille(permille):
+def color_from_permille(permille, dead_now):
+    if dead_now:
+        return (255, 0, 0)
+
     hp = clamp_int(permille, 0, 1000) / 1000.0
     hue = 120.0 * hp
     return hsv_to_rgb(hue, 1.0, 1.0)
 
 
-def send_still_color(arduino, rgb):
-    safe_serial_write(arduino, f"10,{rgb[0]},{rgb[1]},{rgb[2]}.")
-
-
 def load_crop_config():
     if not CONFIG_PATH.exists():
         return MONITOR_INDEX, EVENTS_CROP, HEALTH_CROP
+
     try:
         data = json.loads(CONFIG_PATH.read_text())
         mon = int(data.get("monitor_index", MONITOR_INDEX))
         events = data.get("events_crop", EVENTS_CROP)
         health = data.get("health_crop", HEALTH_CROP)
+
         for key in ("top", "left", "width", "height"):
             if key not in events or key not in health:
                 raise ValueError("crop missing keys")
+
         return mon, events, health
     except Exception as exc:
         print("Failed to load crop config, using defaults:", exc)
@@ -307,73 +460,89 @@ def main():
     lastEventTime = 0.0
 
     good_hp = [0, 0]
-    good_permille = 1000
-    smooth_permille = 1000
+    good_permille = 500
+    smooth_permille = 500
 
     was_dead = False
     dead_confirm = 0
     alive_confirm = 0
     full_confirm = 0
 
-    led_lock_until = 0.0
     last_led_send_time = 0.0
     last_rgb = None
-
     objective_hold_until = 0.0
+
+    max_candidate = None
+    max_candidate_hits = 0
+
+    last_debug_time = 0.0
+    last_debug_tuple = None
+
+    ocr_lock_until = 0.0
+    ocr_bad_since = None
 
     with mss.mss() as sct:
         while True:
             now = time.monotonic()
             monitor = sct.monitors[monitor_index]
 
-            events_region = build_region(monitor, events_crop, monitor_index)
+            events_region = build_region(monitor, events_crop)
             events_bgra = np.array(sct.grab(events_region))
             events_bgr = bgra_to_bgr(events_bgra)
             events_gray = bgr_to_gray(events_bgr)
 
-            if SHOW_DEBUG_WINDOWS:
-                cv2.imshow("Events Debug", events_bgr)
-                cv2.waitKey(1)
-
-            health_region = build_region(monitor, health_crop, monitor_index)
+            health_region = build_region(monitor, health_crop)
             health_bgra = np.array(sct.grab(health_region))
-
-            if SHOW_DEBUG_WINDOWS:
-                cv2.imshow("Health Crop RAW", bgra_to_bgr(health_bgra))
-                cv2.waitKey(1)
-
             health_bw = prep_health_for_ocr(health_bgra)
-
-            if SHOW_DEBUG_WINDOWS:
-                cv2.imshow("Health OCR Input", health_bw)
-                cv2.waitKey(1)
-
             healthTxt = ocr_health_text(health_bw)
 
-            parsed = parse_hp_flexible(healthTxt, good_hp[1])
-            if parsed is not None:
-                cur, mx = parsed
-                ok, cur, mx = accept_hp_reading(cur, mx, good_hp)
+            glitch = is_ocr_glitch(healthTxt)
+            if glitch:
+                ocr_lock_until = max(ocr_lock_until, now + OCR_GLITCH_HOLD_SEC)
+                if ocr_bad_since is None:
+                    ocr_bad_since = now
+            else:
+                ocr_bad_since = None
 
-                if ok:
-                    good_hp[0] = cur
-                    good_hp[1] = mx
+            if not glitch:
+                parsed = parse_hp_flexible(healthTxt, good_hp[1])
+                if parsed is not None:
+                    cur, mx, strong = parsed
 
-                    if mx > 0:
-                        good_permille = int(cur * 1000 / mx)
-                    else:
-                        good_permille = 0
+                    cur = repair_dropped_digit(cur, mx, good_hp[0], good_hp[1])
 
-                    if good_hp[1] > 0:
-                        if cur == 0:
-                            dead_confirm = dead_confirm + 1
-                            alive_confirm = 0
+                    ok, cur, mx, max_candidate, max_candidate_hits = accept_hp_reading(
+                        cur, mx, good_hp, strong, max_candidate, max_candidate_hits
+                    )
+
+                    if ok:
+                        cur = max(0, cur)
+                        mx = max(0, mx)
+                        if mx > 0 and cur > mx:
+                            cur = mx
+
+                        good_hp[0] = cur
+                        good_hp[1] = mx
+
+                        if mx > 0:
+                            good_permille = int(cur * 1000 / mx)
                         else:
-                            alive_confirm = alive_confirm + 1
+                            good_permille = 0
+
+                        if strong and mx > 0 and cur == 0:
+                            dead_confirm += 1
+                            alive_confirm = 0
+                        elif mx > 0 and cur > 0:
+                            alive_confirm += 1
                             dead_confirm = 0
-                    else:
-                        dead_confirm = 0
-                        alive_confirm = 0
+                        else:
+                            dead_confirm = 0
+                            alive_confirm = 0
+
+                        if strong and mx > 0 and good_permille >= FULL_SNAP_PERMILLE:
+                            full_confirm += 1
+                        else:
+                            full_confirm = 0
 
             dead_now = was_dead
             if dead_confirm >= DEAD_FRAMES_REQUIRED:
@@ -382,97 +551,116 @@ def main():
                 dead_now = False
             was_dead = dead_now
 
-            if good_hp[1] > 0:
-                is_full = (good_hp[0] >= good_hp[1]) or (good_permille >= FULL_SNAP_PERMILLE)
-                if is_full:
-                    full_confirm = full_confirm + 1
-                else:
-                    full_confirm = 0
-            else:
-                full_confirm = 0
-
-            full_now = full_confirm >= FULL_FRAMES_REQUIRED
+            smooth_permille = int((smooth_permille * 6 + good_permille * 4) / 10)
+            smooth_permille = quantize_permille(smooth_permille, COLOR_STEP_PERMILLE)
 
             if dead_now:
-                smooth_permille = 0
                 target_rgb = (255, 0, 0)
-            elif full_now:
-                smooth_permille = 1000
+            elif full_confirm >= FULL_FRAMES_REQUIRED:
                 target_rgb = (0, 255, 0)
             else:
-                smooth_permille = int((smooth_permille * 6 + good_permille * 4) / 10)
-                q_permille = quantize_permille(smooth_permille, step=25)
-                target_rgb = color_from_permille(q_permille)
+                target_rgb = color_from_permille(smooth_permille, dead_now)
+
+            if now < ocr_lock_until:
+                if last_rgb is not None:
+                    target_rgb = last_rgb
+                else:
+                    target_rgb = FALLBACK_YELLOW_RGB
+
+            if ocr_bad_since is not None and (now - ocr_bad_since) >= OCR_FALLBACK_YELLOW_AFTER_SEC:
+                target_rgb = FALLBACK_YELLOW_RGB
 
             if PRINT_OCR_DEBUG:
-                print(
-                    "OCR:",
-                    repr(healthTxt),
-                    "HP:",
-                    good_hp,
-                    "permille:",
+                debug_tuple = (
+                    healthTxt,
+                    good_hp[0],
+                    good_hp[1],
                     good_permille,
-                    "smooth:",
                     smooth_permille,
-                    "dead:",
                     dead_now,
-                    "full:",
-                    full_now,
-                    "rgb:",
                     target_rgb,
+                    max_candidate,
+                    max_candidate_hits,
+                    glitch,
+                    round(max(0.0, ocr_lock_until - now), 2),
                 )
+
+                if (now - last_debug_time) >= DEBUG_PRINT_EVERY_SEC and debug_tuple != last_debug_tuple:
+                    print(
+                        "OCR:", repr(healthTxt),
+                        "HP:", good_hp,
+                        "permille:", good_permille,
+                        "smooth:", smooth_permille,
+                        "dead:", dead_now,
+                        "rgb:", target_rgb,
+                        "maxCandidate:", max_candidate,
+                        "hits:", max_candidate_hits,
+                        "glitch:", glitch,
+                        "lock:", round(max(0.0, ocr_lock_until - now), 2),
+                    )
+                    last_debug_time = now
+                    last_debug_tuple = debug_tuple
 
             event_id, loc = detect_event(events_gray, templates)
 
             if event_id is not None:
                 currentEvent[1] = event_id
-                team = detect_team(events_bgr, loc)
-                currentEvent[0] = team
+                currentEvent[0] = detect_team(events_bgr, loc)
             else:
                 currentEvent[0] = -1
                 currentEvent[1] = -1
 
+            team_changed = int(currentEvent[0]) != int(lastEvent[0])
             event_changed = int(currentEvent[1]) != int(lastEvent[1])
-            timed_out = (time.time() - lastEventTime) > 3.0
+            timed_out = (now - lastEventTime) > 3.0
 
-            # trigger objective colors when it changes, or refresh after timeout
-            if (event_changed or timed_out) and int(currentEvent[1]) != -1:
-                if currentEvent[1] == 0:
-                    safe_serial_write(arduino, "3,255,0,255.")
-                    safe_serial_write(arduino, "4,255,0,255.")
-                    print("Baron")
-                elif currentEvent[1] == 1:
-                    safe_serial_write(arduino, "2,255,0,255.")
-                    print("Rift")
-                elif currentEvent[1] == 2:
-                    safe_serial_write(arduino, "1,255,255,255.")
-                    print("Cloud")
-                elif currentEvent[1] == 3:
-                    safe_serial_write(arduino, "1,255,10,0.")
-                    print("Infernal")
-                elif currentEvent[1] == 4:
-                    safe_serial_write(arduino, "1,255,150,0.")
-                    print("Mountain")
-                elif currentEvent[1] == 5:
-                    safe_serial_write(arduino, "1,0,150,255.")
-                    print("Ocean")
-                elif currentEvent[1] == 6:
-                    safe_serial_write(arduino, "3,255,150,255.")
-                    safe_serial_write(arduino, "4,255,150,255.")
-                    print("Elder")
+            if (team_changed or timed_out) and event_changed and int(currentEvent[1]) != -1:
+                if currentEvent[0] == 1:
+                    if currentEvent[1] == 0:
+                        send_color_cmd(arduino, 3, (255, 0, 255))
+                        send_color_cmd(arduino, 4, (255, 0, 255))
+                        print("Baron")
+                    elif currentEvent[1] == 1:
+                        send_color_cmd(arduino, 2, (255, 0, 255))
+                        print("Rift")
+                    elif currentEvent[1] == 2:
+                        send_color_cmd(arduino, 1, (255, 255, 255))
+                        print("Cloud")
+                    elif currentEvent[1] == 3:
+                        send_color_cmd(arduino, 1, (255, 10, 0))
+                        print("Infernal")
+                    elif currentEvent[1] == 4:
+                        send_color_cmd(arduino, 1, (255, 150, 0))
+                        print("Mountain")
+                    elif currentEvent[1] == 5:
+                        send_color_cmd(arduino, 1, (0, 150, 255))
+                        print("Ocean")
+                    elif currentEvent[1] == 6:
+                        send_color_cmd(arduino, 3, (255, 150, 255))
+                        send_color_cmd(arduino, 4, (255, 150, 255))
+                        print("Elder")
 
                 lastEvent = copy.deepcopy(currentEvent)
-                lastEventTime = time.time()
+                lastEventTime = now
                 objective_hold_until = now + OBJECTIVE_HOLD_SEC
 
-            if now >= led_lock_until and now >= objective_hold_until:
-                if operator.sub(now, last_led_send_time) >= 0.08:
+            if now >= objective_hold_until:
+                if (now - last_led_send_time) >= 0.08:
                     if target_rgb != last_rgb:
                         send_still_color(arduino, target_rgb)
                         last_rgb = target_rgb
                         last_led_send_time = now
 
-            time.sleep(0.005)
+            if SHOW_DEBUG_WINDOWS:
+                cv2.imshow("Events Debug", events_bgr)
+                cv2.imshow("Health Crop RAW", bgra_to_bgr(health_bgra))
+                cv2.imshow("Health OCR Input", health_bw)
+
+                key = cv2.waitKey(1) & 0xFF
+                if key == ord("q") or key == 27:
+                    break
+
+    cv2.destroyAllWindows()
 
 
 if __name__ == "__main__":
