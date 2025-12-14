@@ -38,9 +38,7 @@ DEBUG_PRINT_EVERY_SEC = 0.35
 MANA_FOCUS_X = (0.40, 0.62)
 MANA_FOCUS_Y = (0.32, 0.78)
 
-HEALTH_CROP = {"top": 984, "left": 775, "width": 280, "height": 27}
 MANA_CROP = {"top": 996, "left": 775, "width": 280, "height": 27}
-MANA_TOP_OFFSET = int(MANA_CROP["top"] - HEALTH_CROP["top"])
 
 USE_THIN_DIGITS = True
 THIN_ITERATIONS = 1
@@ -48,16 +46,25 @@ THIN_ITERATIONS = 1
 HSV_WHITE_LOW = (0, 0, 160)
 HSV_WHITE_HIGH = (179, 80, 255)
 
+SOLID_COLOR_OPCODE = 10
+
 SWAP_GB_ON_SEND = True
 
 OCR_GLITCH_HOLD_SEC = 0.40
-OCR_FALLBACK_YELLOW_AFTER_SEC = 1.20
+
+DEAD_DETECT_AFTER_SEC = 1.20
+
+REVIVE_FORCE_BLUE_SEC = 1.00
+ALIVE_FRAMES_REQUIRED = 2
+
 FALLBACK_YELLOW_RGB = (255, 255, 0)
 
 COLOR_STEP_PERMILLE = 25
 RGB_STEP = 5
 
-CMD_STILL = 10
+MAX_CANDIDATE_FRAMES_REQUIRED = 6
+
+SEND_EVERY_SEC = 0.08
 
 MANA_GRADIENT_LOW_RGB = (20, 40, 255)
 MANA_GRADIENT_HIGH_RGB = (170, 30, 200)
@@ -70,15 +77,6 @@ pytesseract.pytesseract.tesseract_cmd = TESSERACT_EXE
 print("tesseract_cmd:", pytesseract.pytesseract.tesseract_cmd)
 
 
-def derive_mana_crop(health_crop):
-    return {
-        "top": max(0, int(health_crop["top"]) + MANA_TOP_OFFSET),
-        "left": int(health_crop["left"]),
-        "width": int(health_crop["width"]),
-        "height": int(health_crop["height"]),
-    }
-
-
 def pick_serial_port(preferred):
     if not AUTO_DETECT_SERIAL:
         return preferred
@@ -87,6 +85,10 @@ def pick_serial_port(preferred):
 
     ports = list(list_ports.comports())
     if not ports:
+        return preferred
+
+    devices = [p.device for p in ports]
+    if preferred in devices:
         return preferred
 
     for p in ports:
@@ -101,6 +103,7 @@ def safe_serial_open():
     if not ENABLE_SERIAL:
         return None
     if serial is None:
+        print("pyserial not installed, serial disabled")
         return None
 
     port = pick_serial_port(SERIAL_PORT)
@@ -146,6 +149,10 @@ def to_hw_rgb(rgb):
 def send_color_cmd(arduino, opcode, rgb):
     r, g, b = to_hw_rgb(rgb)
     safe_serial_write(arduino, f"{int(opcode)},{int(r)},{int(g)},{int(b)}.")
+
+
+def send_still_color(arduino, rgb):
+    send_color_cmd(arduino, SOLID_COLOR_OPCODE, rgb)
 
 
 def build_region(monitor, crop):
@@ -208,14 +215,14 @@ def is_ocr_glitch(txt):
     return False
 
 
-def parse_pair(txt, last_max):
+def parse_pair_flexible(txt, last_max):
     m = re.search(r"(\d+)\s*/\s*(\d+)", txt)
     if m:
         cur = int(m.group(1))
         mx = int(m.group(2))
         return cur, mx, True
 
-    m2 = re.search(r"(\d{2,4})", txt)
+    m2 = re.search(r"(\d{1,4})", txt)
     if m2:
         cur = int(m2.group(1))
         if last_max > 0:
@@ -223,6 +230,86 @@ def parse_pair(txt, last_max):
         return cur, cur, False
 
     return None
+
+
+def repair_dropped_digit(cur, mx, last_cur, last_max):
+    if mx <= 0:
+        return cur
+
+    s_cur = str(cur)
+    if len(s_cur) == 1:
+        return cur
+
+    candidates = [cur]
+
+    if last_cur > 0:
+        s_last = str(last_cur)
+        if len(s_cur) < len(s_last):
+            diff = len(s_last) - len(s_cur)
+            if diff <= 2:
+                try:
+                    pref = s_last[:diff]
+                    cand = int(pref + s_cur)
+                    if 0 <= cand <= mx:
+                        candidates.append(cand)
+                except Exception:
+                    pass
+
+    if last_max > 0:
+        s_lastm = str(last_max)
+        if len(s_cur) < len(s_lastm):
+            diff = len(s_lastm) - len(s_cur)
+            if diff <= 2:
+                try:
+                    pref = s_lastm[:diff]
+                    cand = int(pref + s_cur)
+                    if 0 <= cand <= mx:
+                        candidates.append(cand)
+                except Exception:
+                    pass
+
+    if cur * 10 <= mx:
+        candidates.append(cur * 10)
+    if cur * 100 <= mx:
+        candidates.append(cur * 100)
+
+    if last_cur > 0:
+        return min(candidates, key=lambda c: abs(c - last_cur))
+
+    return max(candidates)
+
+
+def repair_extra_digit(cur, mx, last_cur):
+    if mx <= 0:
+        return cur
+
+    candidates = [cur]
+
+    if cur // 10 <= mx:
+        candidates.append(cur // 10)
+    if cur // 100 <= mx:
+        candidates.append(cur // 100)
+
+    s = str(cur)
+    if len(s) > 1:
+        try:
+            candidates.append(int(s[1:]))
+        except Exception:
+            pass
+        try:
+            candidates.append(int(s[:-1]))
+        except Exception:
+            pass
+
+    if cur % 1000 <= mx:
+        candidates.append(cur % 1000)
+    if cur % 10000 <= mx:
+        candidates.append(cur % 10000)
+
+    if last_cur > 0:
+        return min(candidates, key=lambda c: abs(c - last_cur))
+
+    return min(candidates, key=lambda c: abs(mx - c))
 
 
 def clamp_int(v, low, high):
@@ -258,8 +345,48 @@ def quantize_rgb(rgb, step):
     )
 
 
+def accept_reading(cur, mx, last_pair, strong, max_candidate, max_candidate_hits):
+    last_cur, last_max = last_pair
+
+    if mx <= 0:
+        return False, cur, mx, max_candidate, max_candidate_hits
+
+    orig_cur = cur
+    cur = min(cur, mx)
+
+    if not strong and orig_cur > mx:
+        return False, cur, mx, max_candidate, max_candidate_hits
+
+    if strong:
+        if mx < 200 or mx > 9999:
+            return False, cur, mx, max_candidate, max_candidate_hits
+
+        if last_max > 0:
+            ratio = mx / float(last_max)
+            if ratio > 1.35 or ratio < 0.65:
+                if max_candidate == mx:
+                    max_candidate_hits += 1
+                else:
+                    max_candidate = mx
+                    max_candidate_hits = 1
+
+                if max_candidate_hits >= MAX_CANDIDATE_FRAMES_REQUIRED:
+                    max_candidate_hits = 0
+                    return True, cur, mx, None, 0
+
+                return False, cur, mx, max_candidate, max_candidate_hits
+
+    if last_max > 0:
+        jump_cap = max(50, int(last_max * 0.6))
+        if abs(cur - last_cur) > jump_cap and not strong:
+            return False, cur, mx, max_candidate, max_candidate_hits
+
+    return True, cur, mx, None, 0
+
+
 def mana_gradient_from_permille(permille):
-    t = clamp_int(permille, 0, 1000) / 1000.0
+    t = 1.0 - (clamp_int(permille, 0, 1000) / 1000.0)
+
     r0, g0, b0 = MANA_GRADIENT_LOW_RGB
     r1, g1, b1 = MANA_GRADIENT_HIGH_RGB
     return (
@@ -271,41 +398,44 @@ def mana_gradient_from_permille(permille):
 
 def load_crop_config():
     if not CONFIG_PATH.exists():
-        return MONITOR_INDEX, HEALTH_CROP, MANA_CROP
+        return MONITOR_INDEX, MANA_CROP
 
     try:
         data = json.loads(CONFIG_PATH.read_text())
         mon = int(data.get("monitor_index", MONITOR_INDEX))
-        health = data.get("health_crop", HEALTH_CROP)
+        mana = data.get("mana_crop", MANA_CROP)
 
-        mana = data.get("mana_crop", None)
-        if mana is None:
-            mana = derive_mana_crop(health)
+        for key in ("top", "left", "width", "height"):
+            if key not in mana:
+                raise ValueError("mana_crop missing keys")
 
-        for crop in (health, mana):
-            for key in ("top", "left", "width", "height"):
-                if key not in crop:
-                    raise ValueError("crop missing keys")
-
-        return mon, health, mana
+        return mon, mana
     except Exception as exc:
         print("Failed to load crop config, using defaults:", exc)
-        return MONITOR_INDEX, HEALTH_CROP, MANA_CROP
+        return MONITOR_INDEX, MANA_CROP
 
 
 def main():
-    monitor_index, _health_crop, mana_crop = load_crop_config()
+    monitor_index, mana_crop = load_crop_config()
     arduino = safe_serial_open()
 
-    good_pair = [0, 0]
-    good_permille = 500
-    smooth_permille = 500
+    good_mana = [0, 0]
+    mana_permille = 500
+    mana_smooth = 500
+
+    mana_max_candidate = None
+    mana_max_hits = 0
 
     lock_until = 0.0
     bad_since = None
 
-    last_output_rgb = None
+    dead_now = False
+    alive_confirm = 0
+    revive_blue_until = 0.0
+
+    last_stable_rgb = None
     last_sent_rgb = None
+    last_send_time = 0.0
 
     last_debug_time = 0.0
     last_debug_tuple = None
@@ -315,30 +445,44 @@ def main():
             now = time.monotonic()
             monitor = sct.monitors[monitor_index]
 
-            region = build_region(monitor, mana_crop)
-            bgra = np.array(sct.grab(region))
-            bw = prep_bar_for_ocr(bgra, MANA_FOCUS_X, MANA_FOCUS_Y)
-            txt = ocr_bar_text(bw)
+            mana_region = build_region(monitor, mana_crop)
+            mana_bgra = np.array(sct.grab(mana_region))
+            mana_bw = prep_bar_for_ocr(mana_bgra, MANA_FOCUS_X, MANA_FOCUS_Y)
+            mana_txt = ocr_bar_text(mana_bw)
 
             frame_ok = False
             glitch = False
 
-            if is_ocr_glitch(txt):
+            if is_ocr_glitch(mana_txt):
                 glitch = True
             else:
-                parsed = parse_pair(txt, good_pair[1])
+                parsed = parse_pair_flexible(mana_txt, good_mana[1])
                 if parsed is None:
                     glitch = True
                 else:
-                    cur, mx, _strong = parsed
-                    if mx > 0:
-                        cur = min(cur, mx)
-                        good_pair[0] = cur
-                        good_pair[1] = mx
-                        good_permille = int(cur * 1000 / mx)
-                        frame_ok = True
-                    else:
-                        glitch = True
+                    cur, mx, strong = parsed
+
+                    cur = repair_dropped_digit(cur, mx, good_mana[0], good_mana[1])
+
+                    if strong and mx > 0 and cur > mx:
+                        fixed = repair_extra_digit(cur, mx, good_mana[0])
+                        if fixed > mx:
+                            glitch = True
+                        else:
+                            cur = fixed
+
+                    if not glitch:
+                        ok, cur, mx, mana_max_candidate, mana_max_hits = accept_reading(
+                            cur, mx, good_mana, strong, mana_max_candidate, mana_max_hits
+                        )
+
+                        if ok and mx > 0 and 0 <= cur <= mx:
+                            good_mana[0] = cur
+                            good_mana[1] = mx
+                            mana_permille = int(cur * 1000 / mx)
+                            frame_ok = True
+                        else:
+                            glitch = True
 
             if not frame_ok:
                 lock_until = max(lock_until, now + OCR_GLITCH_HOLD_SEC)
@@ -347,53 +491,93 @@ def main():
             else:
                 bad_since = None
 
-            smooth_permille = int((smooth_permille * 6 + good_permille * 4) / 10)
-            smooth_permille = quantize_permille(smooth_permille, COLOR_STEP_PERMILLE)
+            mana_smooth = int((mana_smooth * 6 + mana_permille * 4) / 10)
+            mana_smooth = quantize_permille(mana_smooth, COLOR_STEP_PERMILLE)
 
-            rgb = mana_gradient_from_permille(smooth_permille)
-            rgb = quantize_rgb(rgb, RGB_STEP)
+            mana_rgb = quantize_rgb(mana_gradient_from_permille(mana_smooth), RGB_STEP)
 
-            any_lock = now < lock_until
-            long_bad = (bad_since is not None) and ((now - bad_since) >= OCR_FALLBACK_YELLOW_AFTER_SEC)
-
-            out_rgb = rgb
+            out_rgb = mana_rgb
             reason = "mana"
 
-            if any_lock:
-                out_rgb = last_output_rgb if last_output_rgb is not None else FALLBACK_YELLOW_RGB
+            if now < lock_until:
+                out_rgb = last_stable_rgb if last_stable_rgb is not None else FALLBACK_YELLOW_RGB
                 reason = "lock"
 
-            if long_bad:
-                out_rgb = FALLBACK_YELLOW_RGB
-                reason = "fallback"
+            if bad_since is not None and (now - bad_since) >= DEAD_DETECT_AFTER_SEC:
+                dead_now = True
 
-            if reason == "mana":
-                last_output_rgb = out_rgb
+            if dead_now:
+                out_rgb = last_stable_rgb if last_stable_rgb is not None else FALLBACK_YELLOW_RGB
+                reason = "dead_hold"
+
+                if frame_ok:
+                    alive_confirm += 1
+                else:
+                    alive_confirm = 0
+
+                if alive_confirm >= ALIVE_FRAMES_REQUIRED:
+                    dead_now = False
+                    alive_confirm = 0
+                    revive_blue_until = now + REVIVE_FORCE_BLUE_SEC
+
+            if not dead_now and reason == "mana":
+                last_stable_rgb = out_rgb
+
+            if not dead_now and now < revive_blue_until:
+                out_rgb = quantize_rgb(MANA_GRADIENT_LOW_RGB, RGB_STEP)
+                reason = "revive_blue"
 
             if ENABLE_SERIAL and arduino is not None:
-                if out_rgb != last_sent_rgb:
-                    send_color_cmd(arduino, CMD_STILL, out_rgb)
-                    last_sent_rgb = out_rgb
+                if (now - last_send_time) >= SEND_EVERY_SEC:
+                    if out_rgb != last_sent_rgb:
+                        send_still_color(arduino, out_rgb)
+                        last_sent_rgb = out_rgb
+                        last_send_time = now
 
             if PRINT_OCR_DEBUG:
                 lock_left = round(max(0.0, lock_until - now), 2)
-                debug_tuple = (txt, good_pair[0], good_pair[1], good_permille, smooth_permille, rgb, glitch, lock_left, out_rgb, reason)
+                bad_for = round((now - bad_since), 2) if bad_since is not None else 0.0
+
+                debug_tuple = (
+                    mana_txt,
+                    good_mana[0],
+                    good_mana[1],
+                    mana_permille,
+                    mana_smooth,
+                    mana_rgb,
+                    glitch,
+                    lock_left,
+                    bad_for,
+                    dead_now,
+                    out_rgb,
+                    reason,
+                    mana_max_candidate,
+                    mana_max_hits,
+                )
 
                 if (now - last_debug_time) >= DEBUG_PRINT_EVERY_SEC and debug_tuple != last_debug_tuple:
                     print(
                         "MANA:",
-                        f"[{txt}]",
-                        f"{good_pair[0]}/{good_pair[1]}",
+                        f"[{mana_txt}]",
+                        f"{good_mana[0]}/{good_mana[1]}",
                         "perm",
-                        good_permille,
+                        mana_permille,
                         "smooth",
-                        smooth_permille,
+                        mana_smooth,
                         "rgb",
-                        rgb,
+                        mana_rgb,
                         "glitch",
                         glitch,
                         "lock",
                         lock_left,
+                        "badFor",
+                        bad_for,
+                        "deadLike",
+                        dead_now,
+                        "maxCandidate",
+                        mana_max_candidate,
+                        "hits",
+                        mana_max_hits,
                         "| OUT:",
                         out_rgb,
                         "why",
@@ -403,8 +587,8 @@ def main():
                     last_debug_tuple = debug_tuple
 
             if SHOW_DEBUG_WINDOWS:
-                cv2.imshow("Mana Crop RAW", bgra_to_bgr(bgra))
-                cv2.imshow("Mana OCR Input", bw)
+                cv2.imshow("Mana Crop RAW", bgra_to_bgr(mana_bgra))
+                cv2.imshow("Mana OCR Input", mana_bw)
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q") or key == 27:
                     break

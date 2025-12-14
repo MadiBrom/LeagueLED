@@ -57,16 +57,12 @@ HSV_WHITE_HIGH = (179, 80, 255)
 
 SOLID_COLOR_OPCODE = 10
 
-# Your Arduino test proved G and B are swapped on output.
-# So we send R, B, G instead of R, G, B.
 SWAP_GB_ON_SEND = True
 
-# New behavior for OCR glitches
 OCR_GLITCH_HOLD_SEC = 0.40
 OCR_FALLBACK_YELLOW_AFTER_SEC = 1.20
 FALLBACK_YELLOW_RGB = (255, 255, 0)
 
-# Reduce jitter around mid health colors
 COLOR_STEP_PERMILLE = 25
 
 TEMPLATES = {
@@ -171,12 +167,10 @@ def prep_health_for_ocr(health_bgra):
 
     health_bgr = bgra_to_bgr(focus)
 
-    # Upscale for crisp OCR on tiny HUD digits
     health_bgr = cv2.resize(
         health_bgr, None, fx=4.0, fy=4.0, interpolation=cv2.INTER_CUBIC
     )
 
-    # HSV white filter: keeps the digits, dumps the colored bar noise
     hsv = cv2.cvtColor(health_bgr, cv2.COLOR_BGR2HSV)
     lower = np.array(HSV_WHITE_LOW, dtype=np.uint8)
     upper = np.array(HSV_WHITE_HIGH, dtype=np.uint8)
@@ -235,9 +229,6 @@ def repair_dropped_digit(cur, mx, last_cur, last_max):
 
     s_cur = str(cur)
 
-    # Do NOT try to "repair" single digit reads.
-    # This preserves real death reads like 0/951,
-    # and real low hp like 5/951, 9/951, etc.
     if len(s_cur) == 1:
         return cur
 
@@ -335,8 +326,6 @@ def accept_hp_reading(cur, mx, last_hp, strong, max_candidate, max_candidate_hit
     orig_cur = cur
     cur = min(cur, mx)
 
-    # Critical: if we were in weak parse mode and OCR produced a number bigger than max,
-    # do not clamp it to max and accidentally go full green.
     if not strong and orig_cur > mx:
         return False, cur, mx, max_candidate, max_candidate_hits
 
