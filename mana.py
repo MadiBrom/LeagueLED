@@ -1,4 +1,6 @@
+import copy
 import json
+import operator
 import re
 import time
 from pathlib import Path
@@ -38,8 +40,13 @@ DEBUG_PRINT_EVERY_SEC = 0.35
 MANA_FOCUS_X = (0.40, 0.62)
 MANA_FOCUS_Y = (0.32, 0.78)
 
-EVENTS_CROP = {"top": 233, "left": 1550, "width": 160, "height": 292}
+EVENTS_CROP = {"top": 233, "left": 1760, "width": 150, "height": 102}
 MANA_CROP = {"top": 996, "left": 775, "width": 280, "height": 27}
+
+EVENT_THRESHOLD = 0.8
+
+OBJECTIVE_PULSE_SEC = 2.0
+OBJECTIVE_PRINT_EVERY_SEC = 0.25
 
 USE_THIN_DIGITS = True
 THIN_ITERATIONS = 1
@@ -69,6 +76,16 @@ SEND_EVERY_SEC = 0.08
 
 MANA_GRADIENT_LOW_RGB = (20, 40, 255)
 MANA_GRADIENT_HIGH_RGB = (170, 30, 200)
+
+TEMPLATES = {
+    0: ("Baron", "template/baron.jpg"),
+    1: ("Rift", "template/rift.jpg"),
+    2: ("Cloud", "template/cloud.jpg"),
+    3: ("Infernal", "template/infernal.png"),
+    4: ("Mountain", "template/mountain.jpg"),
+    5: ("Ocean", "template/ocean.jpg"),
+    6: ("Elder", "template/elder.jpg"),
+}
 
 TESSERACT_EXE = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
 if not Path(TESSERACT_EXE).exists():
@@ -167,6 +184,103 @@ def build_region(monitor, crop):
 
 def bgra_to_bgr(img_bgra):
     return img_bgra[:, :, :3]
+
+
+def bgr_to_gray(img_bgr):
+    return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+
+
+def load_templates():
+    loaded = {}
+    for event_id, (name, path) in TEMPLATES.items():
+        img = cv2.imread(path, 0)
+        if img is None:
+            raise RuntimeError("Missing template: " + path)
+        loaded[event_id] = (name, img)
+    return loaded
+
+
+def detect_event(events_gray, templates):
+    best_event = None
+    best_name = None
+    best_loc = None
+    best_score = 0.0
+
+    for event_id, pair in templates.items():
+        name, tpl = pair
+        res = cv2.matchTemplate(events_gray, tpl, cv2.TM_CCOEFF_NORMED)
+        score = float(np.amax(res))
+        if score > best_score:
+            best_score = score
+            best_event = event_id
+            best_name = name
+            best_loc = np.where(res >= EVENT_THRESHOLD)
+
+    if best_event is None:
+        return None, None, best_score, best_name
+
+    if best_score < EVENT_THRESHOLD:
+        return None, None, best_score, best_name
+
+    return best_event, best_loc, best_score, best_name
+
+
+def detect_team(events_bgr, loc):
+    if loc is None:
+        return None
+
+    team = None
+
+    for pt in zip(*loc[::-1]):
+        x = int(pt[0])
+        y = int(pt[1])
+
+        x2 = operator.sub(x, 2)
+        if x2 < 0:
+            continue
+
+        b = int(events_bgr[y, x2, 0])
+        r = int(events_bgr[y, x2, 2])
+
+        if b > 100 and r < 80:
+            team = 1
+        elif b < 80 and r > 120:
+            team = 0
+
+    return team
+
+
+def get_objective_payload(team, event_id):
+    if team != 1:
+        return None, []
+
+    if event_id == 0:
+        return "Baron", [(3, (255, 0, 255)), (4, (255, 0, 255))]
+    if event_id == 1:
+        return "Rift", [(2, (255, 0, 255))]
+    if event_id == 2:
+        return "Cloud", [(1, (255, 255, 255))]
+    if event_id == 3:
+        return "Infernal", [(1, (255, 10, 0))]
+    if event_id == 4:
+        return "Mountain", [(1, (255, 150, 0))]
+    if event_id == 5:
+        return "Ocean", [(1, (0, 150, 255))]
+    if event_id == 6:
+        return "Elder", [(3, (255, 150, 255)), (4, (255, 150, 255))]
+
+    return None, []
+
+
+def send_objective(arduino, team, event_id):
+    name, payload = get_objective_payload(team, event_id)
+    if not payload:
+        return name
+
+    for opcode, rgb in payload:
+        send_color_cmd(arduino, opcode, rgb)
+
+    return name
 
 
 def prep_bar_for_ocr(bar_bgra, focus_x, focus_y):
@@ -399,26 +513,40 @@ def mana_gradient_from_permille(permille):
 
 def load_crop_config():
     if not CONFIG_PATH.exists():
-        return MONITOR_INDEX, MANA_CROP
+        return MONITOR_INDEX, EVENTS_CROP, MANA_CROP
 
     try:
         data = json.loads(CONFIG_PATH.read_text())
         mon = int(data.get("monitor_index", MONITOR_INDEX))
+        events = data.get("events_crop", EVENTS_CROP)
         mana = data.get("mana_crop", MANA_CROP)
 
         for key in ("top", "left", "width", "height"):
+            if key not in events:
+                raise ValueError("events_crop missing keys")
             if key not in mana:
                 raise ValueError("mana_crop missing keys")
 
-        return mon, mana
+        return mon, events, mana
     except Exception as exc:
         print("Failed to load crop config, using defaults:", exc)
-        return MONITOR_INDEX, MANA_CROP
+        return MONITOR_INDEX, EVENTS_CROP, MANA_CROP
 
 
 def main():
-    monitor_index, mana_crop = load_crop_config()
+    monitor_index, events_crop, mana_crop = load_crop_config()
     arduino = safe_serial_open()
+    templates = load_templates()
+
+    last_event = [-1, -1]
+    last_event_time = 0.0
+
+    active_obj_name = None
+    active_obj_team = -1
+    active_obj_event_id = -1
+    active_obj_until = 0.0
+    last_obj_send_time = 0.0
+    last_obj_print_time = 0.0
 
     good_mana = [0, 0]
     mana_permille = 500
@@ -446,6 +574,62 @@ def main():
             now = time.monotonic()
             monitor = sct.monitors[monitor_index]
 
+            # events detection
+            events_region = build_region(monitor, events_crop)
+            events_bgra = np.array(sct.grab(events_region))
+            events_bgr = bgra_to_bgr(events_bgra)
+            events_gray = bgr_to_gray(events_bgr)
+
+            event_id, loc, event_score, event_name = detect_event(events_gray, templates)
+
+            current_event = [-1, -1]
+            if event_id is not None:
+                current_event[1] = event_id
+                team = detect_team(events_bgr, loc)
+                current_event[0] = team if team is not None else -1
+
+            team_changed = int(current_event[0]) != int(last_event[0])
+            event_changed = int(current_event[1]) != int(last_event[1])
+            timed_out = (now - last_event_time) > 3.0
+
+            if (team_changed or timed_out) and event_changed and int(current_event[1]) != -1:
+                obj_name = send_objective(arduino, int(current_event[0]), int(current_event[1]))
+
+                if obj_name is not None:
+                    active_obj_name = obj_name
+                    active_obj_team = int(current_event[0])
+                    active_obj_event_id = int(current_event[1])
+                    active_obj_until = now + OBJECTIVE_PULSE_SEC
+                    last_obj_send_time = 0.0
+                    last_obj_print_time = 0.0
+
+                    print(
+                        "OBJECTIVE TRIGGERED:",
+                        obj_name,
+                        "team",
+                        active_obj_team,
+                        "score",
+                        round(float(event_score), 3),
+                        "pulseSec",
+                        OBJECTIVE_PULSE_SEC,
+                    )
+                else:
+                    print(
+                        "OBJECTIVE DETECTED BUT IGNORED:",
+                        "name",
+                        event_name,
+                        "id",
+                        int(current_event[1]),
+                        "team",
+                        int(current_event[0]),
+                        "score",
+                        round(float(event_score), 3),
+                    )
+
+                last_event = copy.deepcopy(current_event)
+                last_event_time = now
+
+            # mana OCR
             mana_region = build_region(monitor, mana_crop)
             mana_bgra = np.array(sct.grab(mana_region))
             mana_bw = prep_bar_for_ocr(mana_bgra, MANA_FOCUS_X, MANA_FOCUS_Y)
@@ -528,16 +712,38 @@ def main():
                 out_rgb = quantize_rgb(MANA_GRADIENT_LOW_RGB, RGB_STEP)
                 reason = "revive_blue"
 
-            if ENABLE_SERIAL and arduino is not None:
-                if (now - last_send_time) >= SEND_EVERY_SEC:
-                    if out_rgb != last_sent_rgb:
-                        send_still_color(arduino, out_rgb)
-                        last_sent_rgb = out_rgb
-                        last_send_time = now
+            # objective pulse overrides mana for 2 seconds
+            if active_obj_name is not None and now < active_obj_until:
+                if ENABLE_SERIAL and arduino is not None:
+                    if (now - last_obj_send_time) >= SEND_EVERY_SEC:
+                        send_objective(arduino, active_obj_team, active_obj_event_id)
+                        last_obj_send_time = now
+
+                if (now - last_obj_print_time) >= OBJECTIVE_PRINT_EVERY_SEC:
+                    left = round(max(0.0, active_obj_until - now), 2)
+                    print("OBJECTIVE PULSE:", active_obj_name, "leftSec", left)
+                    last_obj_print_time = now
+
+            elif active_obj_name is not None and now >= active_obj_until:
+                print("OBJECTIVE END:", active_obj_name)
+                active_obj_name = None
+                active_obj_team = -1
+                active_obj_event_id = -1
+                last_sent_rgb = None
+
+            # normal mana send only when no objective pulse
+            if active_obj_name is None:
+                if ENABLE_SERIAL and arduino is not None:
+                    if (now - last_send_time) >= SEND_EVERY_SEC:
+                        if out_rgb != last_sent_rgb:
+                            send_still_color(arduino, out_rgb)
+                            last_sent_rgb = out_rgb
+                            last_send_time = now
 
             if PRINT_OCR_DEBUG:
                 lock_left = round(max(0.0, lock_until - now), 2)
                 bad_for = round((now - bad_since), 2) if bad_since is not None else 0.0
+                hold_left = round(max(0.0, active_obj_until - now), 2) if active_obj_name is not None else 0.0
 
                 debug_tuple = (
                     mana_txt,
@@ -554,6 +760,8 @@ def main():
                     reason,
                     mana_max_candidate,
                     mana_max_hits,
+                    hold_left,
+                    active_obj_name,
                 )
 
                 if (now - last_debug_time) >= DEBUG_PRINT_EVERY_SEC and debug_tuple != last_debug_tuple:
@@ -575,19 +783,24 @@ def main():
                         bad_for,
                         "deadLike",
                         dead_now,
-                        "maxCandidate",
-                        mana_max_candidate,
-                        "hits",
-                        mana_max_hits,
+                        "objHoldLeft",
+                        hold_left,
+                        "obj",
+                        active_obj_name,
                         "| OUT:",
                         out_rgb,
                         "why",
                         reason,
+                        "maxCandidate",
+                        mana_max_candidate,
+                        "hits",
+                        mana_max_hits,
                     )
                     last_debug_time = now
                     last_debug_tuple = debug_tuple
 
             if SHOW_DEBUG_WINDOWS:
+                cv2.imshow("Events Debug", events_bgr)
                 cv2.imshow("Mana Crop RAW", bgra_to_bgr(mana_bgra))
                 cv2.imshow("Mana OCR Input", mana_bw)
                 key = cv2.waitKey(1) & 0xFF

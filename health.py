@@ -36,10 +36,12 @@ DEBUG_PRINT_EVERY_SEC = 0.35
 HEALTH_FOCUS_X = (0.40, 0.62)
 HEALTH_FOCUS_Y = (0.32, 0.78)
 
-EVENTS_CROP = {"top": 233, "left": 1550, "width": 160, "height": 292}
+EVENTS_CROP = {"top": 233, "left": 1760, "width": 150, "height": 102}
 HEALTH_CROP = {"top": 984, "left": 775, "width": 280, "height": 27}
 
-OBJECTIVE_HOLD_SEC = 3.6
+OBJECTIVE_PULSE_SEC = 2.0
+OBJECTIVE_PRINT_EVERY_SEC = 0.25
+SEND_EVERY_SEC = 0.08
 
 DEAD_FRAMES_REQUIRED = 4
 ALIVE_FRAMES_REQUIRED = 2
@@ -433,23 +435,25 @@ def detect_event(events_gray, templates):
     best_event = None
     best_loc = None
     best_score = 0.0
+    best_name = None
 
     for event_id, pair in templates.items():
-        _, tpl = pair
+        name, tpl = pair
         res = cv2.matchTemplate(events_gray, tpl, cv2.TM_CCOEFF_NORMED)
         score = float(np.amax(res))
         if score > best_score:
             best_score = score
             best_event = event_id
             best_loc = np.where(res >= EVENT_THRESHOLD)
+            best_name = name
 
     if best_event is None:
-        return None, None
+        return None, None, best_score, best_name
 
     if best_score < EVENT_THRESHOLD:
-        return None, None
+        return None, None, best_score, best_name
 
-    return best_event, best_loc
+    return best_event, best_loc, best_score, best_name
 
 
 def detect_team(events_bgr, loc):
@@ -477,6 +481,39 @@ def detect_team(events_bgr, loc):
     return team
 
 
+def get_objective_payload(team, event_id):
+    if team != 1:
+        return None, []
+
+    if event_id == 0:
+        return "Baron", [(3, (255, 0, 255)), (4, (255, 0, 255))]
+    if event_id == 1:
+        return "Rift", [(2, (255, 0, 255))]
+    if event_id == 2:
+        return "Cloud", [(1, (255, 255, 255))]
+    if event_id == 3:
+        return "Infernal", [(1, (255, 10, 0))]
+    if event_id == 4:
+        return "Mountain", [(1, (255, 150, 0))]
+    if event_id == 5:
+        return "Ocean", [(1, (0, 150, 255))]
+    if event_id == 6:
+        return "Elder", [(3, (255, 150, 255)), (4, (255, 150, 255))]
+
+    return None, []
+
+
+def send_objective(arduino, team, event_id):
+    name, payload = get_objective_payload(team, event_id)
+    if not payload:
+        return name
+
+    for opcode, rgb in payload:
+        send_color_cmd(arduino, opcode, rgb)
+
+    return name
+
+
 def main():
     monitor_index, events_crop, health_crop = load_crop_config()
 
@@ -486,6 +523,13 @@ def main():
     currentEvent = [-1, -1]
     lastEvent = [-1, -1]
     lastEventTime = 0.0
+
+    active_obj_name = None
+    active_obj_team = -1
+    active_obj_event_id = -1
+    active_obj_until = 0.0
+    last_obj_send_time = 0.0
+    last_obj_print_time = 0.0
 
     good_hp = [0, 0]
     good_permille = 500
@@ -498,7 +542,6 @@ def main():
 
     last_led_send_time = 0.0
     last_rgb = None
-    objective_hold_until = 0.0
 
     max_candidate = None
     max_candidate_hits = 0
@@ -599,10 +642,7 @@ def main():
                 target_rgb = color_from_permille(smooth_permille, dead_now)
 
             if now < ocr_lock_until:
-                if last_rgb is not None:
-                    target_rgb = last_rgb
-                else:
-                    target_rgb = FALLBACK_YELLOW_RGB
+                target_rgb = last_rgb if last_rgb is not None else FALLBACK_YELLOW_RGB
 
             if ocr_bad_since is not None and (now - ocr_bad_since) >= OCR_FALLBACK_YELLOW_AFTER_SEC:
                 target_rgb = FALLBACK_YELLOW_RGB
@@ -620,6 +660,8 @@ def main():
                     max_candidate_hits,
                     glitch,
                     round(max(0.0, ocr_lock_until - now), 2),
+                    active_obj_name,
+                    round(max(0.0, active_obj_until - now), 2) if active_obj_name else 0.0,
                 )
 
                 if (now - last_debug_time) >= DEBUG_PRINT_EVERY_SEC and debug_tuple != last_debug_tuple:
@@ -634,15 +676,18 @@ def main():
                         "hits:", max_candidate_hits,
                         "glitch:", glitch,
                         "lock:", round(max(0.0, ocr_lock_until - now), 2),
+                        "obj:", active_obj_name,
+                        "objLeft:", round(max(0.0, active_obj_until - now), 2) if active_obj_name else 0.0,
                     )
                     last_debug_time = now
                     last_debug_tuple = debug_tuple
 
-            event_id, loc = detect_event(events_gray, templates)
+            event_id, loc, event_score, event_name = detect_event(events_gray, templates)
 
             if event_id is not None:
                 currentEvent[1] = event_id
-                currentEvent[0] = detect_team(events_bgr, loc)
+                team = detect_team(events_bgr, loc)
+                currentEvent[0] = team if team is not None else -1
             else:
                 currentEvent[0] = -1
                 currentEvent[1] = -1
@@ -652,37 +697,62 @@ def main():
             timed_out = (now - lastEventTime) > 3.0
 
             if (team_changed or timed_out) and event_changed and int(currentEvent[1]) != -1:
-                if currentEvent[0] == 1:
-                    if currentEvent[1] == 0:
-                        send_color_cmd(arduino, 3, (255, 0, 255))
-                        send_color_cmd(arduino, 4, (255, 0, 255))
-                        print("Baron")
-                    elif currentEvent[1] == 1:
-                        send_color_cmd(arduino, 2, (255, 0, 255))
-                        print("Rift")
-                    elif currentEvent[1] == 2:
-                        send_color_cmd(arduino, 1, (255, 255, 255))
-                        print("Cloud")
-                    elif currentEvent[1] == 3:
-                        send_color_cmd(arduino, 1, (255, 10, 0))
-                        print("Infernal")
-                    elif currentEvent[1] == 4:
-                        send_color_cmd(arduino, 1, (255, 150, 0))
-                        print("Mountain")
-                    elif currentEvent[1] == 5:
-                        send_color_cmd(arduino, 1, (0, 150, 255))
-                        print("Ocean")
-                    elif currentEvent[1] == 6:
-                        send_color_cmd(arduino, 3, (255, 150, 255))
-                        send_color_cmd(arduino, 4, (255, 150, 255))
-                        print("Elder")
+                obj_name = send_objective(arduino, int(currentEvent[0]), int(currentEvent[1]))
+
+                if obj_name is not None:
+                    active_obj_name = obj_name
+                    active_obj_team = int(currentEvent[0])
+                    active_obj_event_id = int(currentEvent[1])
+                    active_obj_until = now + OBJECTIVE_PULSE_SEC
+                    last_obj_send_time = 0.0
+                    last_obj_print_time = 0.0
+
+                    print(
+                        "OBJECTIVE TRIGGERED:",
+                        obj_name,
+                        "team",
+                        active_obj_team,
+                        "score",
+                        round(float(event_score), 3),
+                        "pulseSec",
+                        OBJECTIVE_PULSE_SEC,
+                    )
+                else:
+                    print(
+                        "OBJECTIVE DETECTED BUT IGNORED:",
+                        "name",
+                        event_name,
+                        "id",
+                        int(currentEvent[1]),
+                        "team",
+                        int(currentEvent[0]),
+                        "score",
+                        round(float(event_score), 3),
+                    )
 
                 lastEvent = copy.deepcopy(currentEvent)
                 lastEventTime = now
-                objective_hold_until = now + OBJECTIVE_HOLD_SEC
 
-            if now >= objective_hold_until:
-                if (now - last_led_send_time) >= 0.08:
+            # objective pulse block: resend objective for 2 seconds and print countdown
+            if active_obj_name is not None and now < active_obj_until:
+                if arduino is not None and (now - last_obj_send_time) >= SEND_EVERY_SEC:
+                    send_objective(arduino, active_obj_team, active_obj_event_id)
+                    last_obj_send_time = now
+
+                if (now - last_obj_print_time) >= OBJECTIVE_PRINT_EVERY_SEC:
+                    left = round(max(0.0, active_obj_until - now), 2)
+                    print("OBJECTIVE PULSE:", active_obj_name, "leftSec", left)
+                    last_obj_print_time = now
+
+            elif active_obj_name is not None and now >= active_obj_until:
+                print("OBJECTIVE END:", active_obj_name)
+                active_obj_name = None
+                active_obj_team = -1
+                active_obj_event_id = -1
+
+            # only send hp colors when no objective pulse active
+            if active_obj_name is None:
+                if (now - last_led_send_time) >= SEND_EVERY_SEC:
                     if target_rgb != last_rgb:
                         send_still_color(arduino, target_rgb)
                         last_rgb = target_rgb
