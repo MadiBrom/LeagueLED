@@ -37,7 +37,7 @@ HEALTH_FOCUS_X = (0.40, 0.62)
 HEALTH_FOCUS_Y = (0.32, 0.78)
 
 EVENTS_CROP = {"top": 233, "left": 1550, "width": 160, "height": 292}
-HEALTH_CROP = {"top": 1000, "left": 606, "width": 350, "height": 30 }
+HEALTH_CROP = {"top": 984, "left": 775, "width": 280, "height": 27}
 
 OBJECTIVE_HOLD_SEC = 3.6
 
@@ -75,8 +75,12 @@ TEMPLATES = {
     6: ("Elder", "template/elder.jpg"),
 }
 
-pytesseract.pytesseract.tesseract_cmd = r"C:\Users\tjfle\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
+TESSERACT_EXE = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+if not Path(TESSERACT_EXE).exists():
+    raise RuntimeError("Tesseract exe not found at: " + TESSERACT_EXE)
 
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_EXE
+print("tesseract_cmd:", pytesseract.pytesseract.tesseract_cmd)
 
 
 def pick_serial_port(preferred):

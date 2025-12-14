@@ -38,6 +38,7 @@ DEBUG_PRINT_EVERY_SEC = 0.35
 MANA_FOCUS_X = (0.40, 0.62)
 MANA_FOCUS_Y = (0.32, 0.78)
 
+EVENTS_CROP = {"top": 233, "left": 1550, "width": 160, "height": 292}
 MANA_CROP = {"top": 996, "left": 775, "width": 280, "height": 27}
 
 USE_THIN_DIGITS = True
