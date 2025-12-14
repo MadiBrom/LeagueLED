@@ -31,7 +31,6 @@ HEALTH_FOCUS_X = (0.40, 0.62)
 HEALTH_FOCUS_Y = (0.32, 0.78)
 
 EVENTS_CROP = {"top": 233, "left": 1550, "width": 160, "height": 292}
-
 HEALTH_CROP = {"top": 984, "left": 775, "width": 280, "height": 27}
 
 OBJECTIVE_HOLD_SEC = 3.6
@@ -76,9 +75,9 @@ def safe_serial_write(arduino, text):
         print("Serial write failed:", exc)
 
 
-def build_region(monitor, crop):
+def build_region(monitor, crop, mon_index):
     return {
-        "mon": MONITOR_INDEX,
+        "mon": mon_index,
         "top": monitor["top"] + crop["top"],
         "left": monitor["left"] + crop["left"],
         "width": crop["width"],
@@ -103,11 +102,15 @@ def prep_health_for_ocr(health_bgra):
     y2 = min(h, int(h * HEALTH_FOCUS_Y[1]))
     focus = health_bgra[y1:y2, x1:x2]
 
+    # keep top part only, helps avoid reading the second line
+    focus = focus[: int(focus.shape[0] * 0.60), :]
+
     health_bgr = bgra_to_bgr(focus)
     gray = bgr_to_gray(health_bgr)
 
     gray = cv2.resize(gray, None, fx=2.0, fy=2.0, interpolation=cv2.INTER_LINEAR)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
+
     _, bw = cv2.threshold(gray, 150, 255, cv2.THRESH_BINARY)
 
     return bw
@@ -115,7 +118,11 @@ def prep_health_for_ocr(health_bgra):
 
 def ocr_health_text(health_bw):
     dash = chr(45)
-    cfg = f"{dash}{dash}psm 7 {dash}c tessedit_char_whitelist=0123456789/"
+    cfg = (
+        f"{dash}{dash}psm 7 "
+        f"{dash}c classify_bln_numeric_mode=1 "
+        f"{dash}c tessedit_char_whitelist=0123456789/"
+    )
     txt = pytesseract.image_to_string(health_bw, config=cfg)
     return txt.strip().replace(" ", "")
 
@@ -127,10 +134,13 @@ def parse_hp_flexible(txt, last_max):
         mx = int(m.group(2))
         return cur, mx
 
+    # fallback when slash vanishes, only accept if it is believable
     m2 = re.search(r"(\d{2,4})", txt)
     if m2:
         cur = int(m2.group(1))
         if last_max > 0:
+            if cur > last_max:
+                return None
             return cur, last_max
         return cur, cur
 
@@ -145,17 +155,20 @@ def clamp_int(v, low, high):
     return v
 
 
-def quantize_permille(permille, step=50):
+def quantize_permille(permille, step=25):
     permille = clamp_int(permille, 0, 1000)
     return int(round(permille / step) * step)
 
 
 def accept_hp_reading(cur, mx, last_hp):
     last_cur, last_max = last_hp
+
     if mx <= 0:
         return False, cur, mx
 
-    cur = min(cur, mx)
+    # hard reject impossible reads, do not clamp into full
+    if cur > mx:
+        return False, cur, mx
 
     if last_max > 0:
         if mx > last_max * 1.35 or mx < last_max * 0.65:
@@ -197,10 +210,7 @@ def hsv_to_rgb(h, s, v):
     )
 
 
-def color_from_permille(permille, dead_now):
-    if dead_now:
-        return (255, 0, 0)
-
+def color_from_permille(permille):
     hp = clamp_int(permille, 0, 1000) / 1000.0
     hue = 120.0 * hp
     return hsv_to_rgb(hue, 1.0, 1.0)
@@ -303,6 +313,7 @@ def main():
     was_dead = False
     dead_confirm = 0
     alive_confirm = 0
+    full_confirm = 0
 
     led_lock_until = 0.0
     last_led_send_time = 0.0
@@ -310,14 +321,12 @@ def main():
 
     objective_hold_until = 0.0
 
-    full_confirm = 0
-
     with mss.mss() as sct:
         while True:
             now = time.monotonic()
             monitor = sct.monitors[monitor_index]
 
-            events_region = build_region(monitor, events_crop)
+            events_region = build_region(monitor, events_crop, monitor_index)
             events_bgra = np.array(sct.grab(events_region))
             events_bgr = bgra_to_bgr(events_bgra)
             events_gray = bgr_to_gray(events_bgr)
@@ -326,7 +335,7 @@ def main():
                 cv2.imshow("Events Debug", events_bgr)
                 cv2.waitKey(1)
 
-            health_region = build_region(monitor, health_crop)
+            health_region = build_region(monitor, health_crop, monitor_index)
             health_bgra = np.array(sct.grab(health_region))
 
             if SHOW_DEBUG_WINDOWS:
@@ -347,13 +356,6 @@ def main():
                 ok, cur, mx = accept_hp_reading(cur, mx, good_hp)
 
                 if ok:
-                    if mx < 0:
-                        mx = 0
-                    if cur < 0:
-                        cur = 0
-                    if mx > 0 and cur > mx:
-                        cur = mx
-
                     good_hp[0] = cur
                     good_hp[1] = mx
 
@@ -380,8 +382,27 @@ def main():
                 dead_now = False
             was_dead = dead_now
 
-            smooth_permille = int((smooth_permille * 6 + good_permille * 4) / 10)
-            target_rgb = color_from_permille(smooth_permille, dead_now)
+            if good_hp[1] > 0:
+                is_full = (good_hp[0] >= good_hp[1]) or (good_permille >= FULL_SNAP_PERMILLE)
+                if is_full:
+                    full_confirm = full_confirm + 1
+                else:
+                    full_confirm = 0
+            else:
+                full_confirm = 0
+
+            full_now = full_confirm >= FULL_FRAMES_REQUIRED
+
+            if dead_now:
+                smooth_permille = 0
+                target_rgb = (255, 0, 0)
+            elif full_now:
+                smooth_permille = 1000
+                target_rgb = (0, 255, 0)
+            else:
+                smooth_permille = int((smooth_permille * 6 + good_permille * 4) / 10)
+                q_permille = quantize_permille(smooth_permille, step=25)
+                target_rgb = color_from_permille(q_permille)
 
             if PRINT_OCR_DEBUG:
                 print(
@@ -395,6 +416,8 @@ def main():
                     smooth_permille,
                     "dead:",
                     dead_now,
+                    "full:",
+                    full_now,
                     "rgb:",
                     target_rgb,
                 )
@@ -409,39 +432,37 @@ def main():
                 currentEvent[0] = -1
                 currentEvent[1] = -1
 
-            team_changed = int(currentEvent[0]) != int(lastEvent[0])
             event_changed = int(currentEvent[1]) != int(lastEvent[1])
             timed_out = (time.time() - lastEventTime) > 3.0
 
-            if (team_changed or timed_out) and event_changed and int(currentEvent[1]) != -1:
-                if currentEvent[0] == 1:
-                    if currentEvent[1] == 0:
-                        safe_serial_write(arduino, "3,255,0,255.")
-                        safe_serial_write(arduino, "4,255,0,255.")
-                        print("Baron")
-                    if currentEvent[1] == 1:
-                        safe_serial_write(arduino, "2,255,0,255.")
-                        print("Rift")
-                    elif currentEvent[1] == 2:
-                        safe_serial_write(arduino, "1,255,255,255.")
-                        print("Cloud")
-                    elif currentEvent[1] == 3:
-                        safe_serial_write(arduino, "1,255,10,0.")
-                        print("Infernal")
-                    elif currentEvent[1] == 4:
-                        safe_serial_write(arduino, "1,255,150,0.")
-                        print("Mountain")
-                    elif currentEvent[1] == 5:
-                        safe_serial_write(arduino, "1,0,150,255.")
-                        print("Ocean")
-                    elif currentEvent[1] == 6:
-                        safe_serial_write(arduino, "3,255,150,255.")
-                        safe_serial_write(arduino, "4,255,150,255.")
-                        print("Elder")
+            # trigger objective colors when it changes, or refresh after timeout
+            if (event_changed or timed_out) and int(currentEvent[1]) != -1:
+                if currentEvent[1] == 0:
+                    safe_serial_write(arduino, "3,255,0,255.")
+                    safe_serial_write(arduino, "4,255,0,255.")
+                    print("Baron")
+                elif currentEvent[1] == 1:
+                    safe_serial_write(arduino, "2,255,0,255.")
+                    print("Rift")
+                elif currentEvent[1] == 2:
+                    safe_serial_write(arduino, "1,255,255,255.")
+                    print("Cloud")
+                elif currentEvent[1] == 3:
+                    safe_serial_write(arduino, "1,255,10,0.")
+                    print("Infernal")
+                elif currentEvent[1] == 4:
+                    safe_serial_write(arduino, "1,255,150,0.")
+                    print("Mountain")
+                elif currentEvent[1] == 5:
+                    safe_serial_write(arduino, "1,0,150,255.")
+                    print("Ocean")
+                elif currentEvent[1] == 6:
+                    safe_serial_write(arduino, "3,255,150,255.")
+                    safe_serial_write(arduino, "4,255,150,255.")
+                    print("Elder")
 
                 lastEvent = copy.deepcopy(currentEvent)
                 lastEventTime = time.time()
-
                 objective_hold_until = now + OBJECTIVE_HOLD_SEC
 
             if now >= led_lock_until and now >= objective_hold_until:
@@ -450,6 +471,8 @@ def main():
                         send_still_color(arduino, target_rgb)
                         last_rgb = target_rgb
                         last_led_send_time = now
+
+            time.sleep(0.005)
 
 
 if __name__ == "__main__":
