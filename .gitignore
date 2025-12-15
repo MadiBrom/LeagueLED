@@ -8,3 +8,5 @@ __pycache__/
 .pytest_cache/
 
 /hpdebug.py
+/mana.py
+/health.py
