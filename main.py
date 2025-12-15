@@ -9,11 +9,7 @@ import cv2
 import mss
 import numpy as np
 import pytesseract
-
-try:
-    import serial
-except Exception:
-    serial = None
+import serial
 
 try:
     from serial.tools import list_ports
@@ -23,43 +19,57 @@ except Exception:
 
 print("RUNNING:", Path(__file__).resolve())
 
-ENABLE_SERIAL = True
+# ================= SERIAL CONFIG =================
 
 SERIAL_PORT = "COM3"
 SERIAL_BAUD = 9600
 AUTO_DETECT_SERIAL = True
 
+# ================= OCR CONFIG =================
+
+TESSERACT_EXE = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+if not Path(TESSERACT_EXE).exists():
+    raise RuntimeError("Tesseract exe not found at: " + TESSERACT_EXE)
+
+pytesseract.pytesseract.tesseract_cmd = TESSERACT_EXE
+print("tesseract_cmd:", pytesseract.pytesseract.tesseract_cmd)
+
+HSV_WHITE_LOW = (0, 0, 160)
+HSV_WHITE_HIGH = (179, 80, 255)
+
+USE_THIN_DIGITS = True
+THIN_ITERATIONS = 1
+
+# ================= SCREEN CONFIG =================
+
 CONFIG_PATH = Path("crops.json")
-
 MONITOR_INDEX = 1
-EVENT_THRESHOLD = 0.8
 
-SHOW_DEBUG_WINDOWS = True
-PRINT_OCR_DEBUG = True
-DEBUG_PRINT_EVERY_SEC = 0.35
+EVENTS_CROP = {"top": 233, "left": 1760, "width": 150, "height": 102}
+HEALTH_CROP = {"top": 984, "left": 775, "width": 280, "height": 27}
+MANA_CROP = {"top": 996, "left": 775, "width": 280, "height": 27}
 
 HEALTH_FOCUS_X = (0.40, 0.62)
 HEALTH_FOCUS_Y = (0.32, 0.78)
 MANA_FOCUS_X = (0.40, 0.62)
 MANA_FOCUS_Y = (0.32, 0.78)
 
-EVENTS_CROP = {"top": 233, "left": 1550, "width": 160, "height": 292}
-HEALTH_CROP = {"top": 984, "left": 775, "width": 280, "height": 27}
-MANA_CROP = {"top": 996, "left": 775, "width": 280, "height": 27}
+SHOW_DEBUG_WINDOWS = True
+PRINT_DEBUG = True
+DEBUG_PRINT_EVERY_SEC = 0.35
 
-MANA_TOP_OFFSET = int(MANA_CROP["top"] - HEALTH_CROP["top"])
+# ================= LED SEND CONFIG =================
 
+SOLID_COLOR_OPCODE = 10
+SWAP_GB_ON_SEND = True
+SEND_EVERY_SEC = 0.08
 
-def derive_mana_crop(health_crop):
-    return {
-        "top": max(0, int(health_crop["top"]) + MANA_TOP_OFFSET),
-        "left": int(health_crop["left"]),
-        "width": int(health_crop["width"]),
-        "height": int(health_crop["height"]),
-    }
+COLOR_STEP_PERMILLE = 25
 
-
-OBJECTIVE_HOLD_SEC = 3.6
+# HP glitch fallback behavior
+HP_OCR_GLITCH_HOLD_SEC = 0.40
+HP_OCR_FALLBACK_YELLOW_AFTER_SEC = 1.20
+FALLBACK_YELLOW_RGB = (255, 255, 0)
 
 DEAD_FRAMES_REQUIRED = 4
 ALIVE_FRAMES_REQUIRED = 2
@@ -69,23 +79,20 @@ FULL_SNAP_PERMILLE = 995
 
 MAX_CANDIDATE_FRAMES_REQUIRED = 6
 
-USE_THIN_DIGITS = True
-THIN_ITERATIONS = 1
+# Mana dead like behavior
+MANA_OCR_GLITCH_HOLD_SEC = 0.40
+MANA_DEAD_DETECT_AFTER_SEC = 1.20
+MANA_REVIVE_FORCE_BLUE_SEC = 1.00
+MANA_ALIVE_FRAMES_REQUIRED = 2
 
-HSV_WHITE_LOW = (0, 0, 160)
-HSV_WHITE_HIGH = (179, 80, 255)
-
-SWAP_GB_ON_SEND = True
-
-OCR_GLITCH_HOLD_SEC = 0.40
-OCR_FALLBACK_YELLOW_AFTER_SEC = 1.20
-FALLBACK_YELLOW_RGB = (255, 255, 0)
-
-COLOR_STEP_PERMILLE = 25
-
+RGB_STEP = 5
 MANA_GRADIENT_LOW_RGB = (20, 40, 255)
 MANA_GRADIENT_HIGH_RGB = (170, 30, 200)
-RGB_STEP = 5
+
+# Objective detection
+EVENT_THRESHOLD = 0.8
+OBJECTIVE_PULSE_SEC = 2.0
+OBJECTIVE_PRINT_EVERY_SEC = 0.25
 
 TEMPLATES = {
     0: ("Baron", "template/baron.jpg"),
@@ -97,29 +104,19 @@ TEMPLATES = {
     6: ("Elder", "template/elder.jpg"),
 }
 
-TESSERACT_EXE = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
-if not Path(TESSERACT_EXE).exists():
-    raise RuntimeError("Tesseract exe not found at: " + TESSERACT_EXE)
 
-pytesseract.pytesseract.tesseract_cmd = TESSERACT_EXE
-print("tesseract_cmd:", pytesseract.pytesseract.tesseract_cmd)
+# ================= UTIL =================
 
-CMD_STILL = 10
-CMD_OBJECTIVE_PULSE = 2
-START_OUTPUT_MODE = "hp"
-
-OBJECTIVE_PULSE_RGB = (255, 180, 0)
-OBJECTIVE_PULSE_SEC = 2.4
-
-
-def pick_serial_port(preferred):
-    if not AUTO_DETECT_SERIAL:
-        return preferred
-    if list_ports is None:
+def pick_serial_port(preferred: str) -> str:
+    if not AUTO_DETECT_SERIAL or list_ports is None:
         return preferred
 
     ports = list(list_ports.comports())
     if not ports:
+        return preferred
+
+    devices = [p.device for p in ports]
+    if preferred in devices:
         return preferred
 
     for p in ports:
@@ -131,20 +128,11 @@ def pick_serial_port(preferred):
 
 
 def safe_serial_open():
-    if not ENABLE_SERIAL:
-        return None
-    if serial is None:
-        return None
-
     port = pick_serial_port(SERIAL_PORT)
     try:
         print("Serial trying:", port)
-        ar = serial.Serial(port, SERIAL_BAUD, timeout=0)
+        ar = serial.Serial(port, SERIAL_BAUD, timeout=0.05)
         time.sleep(2.0)
-        try:
-            ar.reset_input_buffer()
-        except Exception:
-            pass
         return ar
     except Exception as exc:
         print("Serial open failed:", exc)
@@ -154,10 +142,8 @@ def safe_serial_open():
 _last_serial_fail = 0.0
 
 
-def safe_serial_write(arduino, text):
+def safe_serial_write(arduino, text: str):
     global _last_serial_fail
-    if not ENABLE_SERIAL:
-        return
     if arduino is None:
         return
     try:
@@ -171,41 +157,49 @@ def safe_serial_write(arduino, text):
 
 def to_hw_rgb(rgb):
     r, g, b = rgb
-    if SWAP_GB_ON_SEND:
-        return (r, b, g)
-    return (r, g, b)
+    return (r, b, g) if SWAP_GB_ON_SEND else (r, g, b)
 
 
-def send_color_cmd(arduino, opcode, rgb):
+def send_color_cmd(arduino, opcode: int, rgb):
     r, g, b = to_hw_rgb(rgb)
     safe_serial_write(arduino, f"{int(opcode)},{int(r)},{int(g)},{int(b)}.")
 
 
-def read_arduino_lines(arduino, buf):
-    if arduino is None:
-        return buf, []
+def send_still_color(arduino, rgb):
+    send_color_cmd(arduino, SOLID_COLOR_OPCODE, rgb)
 
-    try:
-        n = arduino.in_waiting
-    except Exception:
-        return buf, []
 
-    if n <= 0:
-        return buf, []
+def clamp_int(v: int, low: int, high: int) -> int:
+    if v < low:
+        return low
+    if v > high:
+        return high
+    return v
 
-    try:
-        buf += arduino.read(n).decode(errors="ignore")
-    except Exception:
-        return buf, []
 
-    lines = []
-    while "\n" in buf:
-        line, buf = buf.split("\n", 1)
-        line = line.strip()
-        if line:
-            lines.append(line)
+def quantize_permille(permille: int, step: int) -> int:
+    permille = clamp_int(int(permille), 0, 1000)
+    return int(round(permille / float(step)) * step)
 
-    return buf, lines
+
+def clamp_rgb(rgb):
+    return (
+        clamp_int(int(rgb[0]), 0, 255),
+        clamp_int(int(rgb[1]), 0, 255),
+        clamp_int(int(rgb[2]), 0, 255),
+    )
+
+
+def quantize_rgb(rgb, step: int):
+    if step <= 1:
+        return clamp_rgb(rgb)
+    return clamp_rgb(
+        (
+            int(round(rgb[0] / float(step)) * step),
+            int(round(rgb[1] / float(step)) * step),
+            int(round(rgb[2] / float(step)) * step),
+        )
+    )
 
 
 def build_region(monitor, crop):
@@ -224,6 +218,24 @@ def bgra_to_bgr(img_bgra):
 def bgr_to_gray(img_bgr):
     return cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
 
+
+def load_crop_config():
+    if not CONFIG_PATH.exists():
+        return MONITOR_INDEX, EVENTS_CROP, HEALTH_CROP, MANA_CROP
+
+    try:
+        data = json.loads(CONFIG_PATH.read_text())
+        mon = int(data.get("monitor_index", MONITOR_INDEX))
+        events = data.get("events_crop", EVENTS_CROP)
+        health = data.get("health_crop", HEALTH_CROP)
+        mana = data.get("mana_crop", MANA_CROP)
+        return mon, events, health, mana
+    except Exception as exc:
+        print("Failed to load crop config, using defaults:", exc)
+        return MONITOR_INDEX, EVENTS_CROP, HEALTH_CROP, MANA_CROP
+
+
+# ================= OCR PIPE =================
 
 def prep_bar_for_ocr(bar_bgra, focus_x, focus_y):
     h, w, _ = bar_bgra.shape
@@ -262,7 +274,7 @@ def ocr_bar_text(bar_bw):
     return txt.strip().replace(" ", "")
 
 
-def is_ocr_glitch(txt):
+def is_ocr_glitch(txt: str) -> bool:
     if not txt:
         return True
     if txt.count("/") != 1:
@@ -272,14 +284,14 @@ def is_ocr_glitch(txt):
     return False
 
 
-def parse_hp_flexible(txt, last_max):
+def parse_pair_flexible(txt: str, last_max: int):
     m = re.search(r"(\d+)\s*/\s*(\d+)", txt)
     if m:
         cur = int(m.group(1))
         mx = int(m.group(2))
         return cur, mx, True
 
-    m2 = re.search(r"(\d{2,4})", txt)
+    m2 = re.search(r"(\d{1,4})", txt)
     if m2:
         cur = int(m2.group(1))
         if last_max > 0:
@@ -369,19 +381,6 @@ def repair_extra_digit(cur, mx, last_cur):
     return min(candidates, key=lambda c: abs(mx - c))
 
 
-def clamp_int(v, low, high):
-    if v < low:
-        return low
-    if v > high:
-        return high
-    return v
-
-
-def quantize_permille(permille, step):
-    permille = clamp_int(int(permille), 0, 1000)
-    return int(round(permille / float(step)) * step)
-
-
 def accept_reading(cur, mx, last_pair, strong, max_candidate, max_candidate_hits):
     last_cur, last_max = last_pair
 
@@ -421,10 +420,12 @@ def accept_reading(cur, mx, last_pair, strong, max_candidate, max_candidate_hits
     return True, cur, mx, None, 0
 
 
+# ================= COLORS =================
+
 def hsv_to_rgb(h, s, v):
     h = float(h % 360.0)
-    s = float(clamp_int(int(s * 1000), 0, 1000)) / 1000.0
-    v = float(clamp_int(int(v * 1000), 0, 1000)) / 1000.0
+    s = float(s)
+    v = float(v)
 
     c = v * s
     x = c * (1 - abs((h / 60.0) % 2 - 1))
@@ -443,19 +444,23 @@ def hsv_to_rgb(h, s, v):
     else:
         r1, g1, b1 = c, 0, x
 
-    return (int((r1 + m) * 255), int((g1 + m) * 255), int((b1 + m) * 255))
+    return (
+        int((r1 + m) * 255),
+        int((g1 + m) * 255),
+        int((b1 + m) * 255),
+    )
 
 
-def health_color_from_permille(permille, dead_now):
+def hp_color_from_permille(permille: int, dead_now: bool):
     if dead_now:
         return (255, 0, 0)
-    hp = clamp_int(permille, 0, 1000) / 1000.0
-    hue = 120.0 * hp
+    p = clamp_int(permille, 0, 1000) / 1000.0
+    hue = 120.0 * p
     return hsv_to_rgb(hue, 1.0, 1.0)
 
 
-def mana_gradient_from_permille(permille):
-    t = clamp_int(permille, 0, 1000) / 1000.0
+def mana_gradient_from_permille(permille: int):
+    t = 1.0 - (clamp_int(permille, 0, 1000) / 1000.0)
     r0, g0, b0 = MANA_GRADIENT_LOW_RGB
     r1, g1, b1 = MANA_GRADIENT_HIGH_RGB
     return (
@@ -465,55 +470,11 @@ def mana_gradient_from_permille(permille):
     )
 
 
-def clamp_rgb(rgb):
-    return (
-        clamp_int(int(rgb[0]), 0, 255),
-        clamp_int(int(rgb[1]), 0, 255),
-        clamp_int(int(rgb[2]), 0, 255),
-    )
-
-
-def quantize_rgb(rgb, step):
-    if step <= 1:
-        return clamp_rgb(rgb)
-    return clamp_rgb(
-        (
-            int(round(rgb[0] / float(step)) * step),
-            int(round(rgb[1] / float(step)) * step),
-            int(round(rgb[2] / float(step)) * step),
-        )
-    )
-
-
-def load_crop_config():
-    if not CONFIG_PATH.exists():
-        return MONITOR_INDEX, EVENTS_CROP, HEALTH_CROP, MANA_CROP
-
-    try:
-        data = json.loads(CONFIG_PATH.read_text())
-        mon = int(data.get("monitor_index", MONITOR_INDEX))
-        events = data.get("events_crop", EVENTS_CROP)
-        health = data.get("health_crop", HEALTH_CROP)
-
-        mana = data.get("mana_crop", None)
-        if mana is None:
-            mana = derive_mana_crop(health)
-
-        for crop in (events, health, mana):
-            for key in ("top", "left", "width", "height"):
-                if key not in crop:
-                    raise ValueError("crop missing keys")
-
-        return mon, events, health, mana
-    except Exception as exc:
-        print("Failed to load crop config, using defaults:", exc)
-        return MONITOR_INDEX, EVENTS_CROP, HEALTH_CROP, MANA_CROP
-
+# ================= OBJECTIVES =================
 
 def load_templates():
     loaded = {}
-    for event_id, pair in TEMPLATES.items():
-        name, path = pair
+    for event_id, (name, path) in TEMPLATES.items():
         img = cv2.imread(path, 0)
         if img is None:
             raise RuntimeError("Missing template: " + path)
@@ -523,22 +484,24 @@ def load_templates():
 
 def detect_event(events_gray, templates):
     best_event = None
+    best_name = None
     best_loc = None
     best_score = 0.0
 
     for event_id, pair in templates.items():
-        _, tpl = pair
+        name, tpl = pair
         res = cv2.matchTemplate(events_gray, tpl, cv2.TM_CCOEFF_NORMED)
         score = float(np.amax(res))
         if score > best_score:
             best_score = score
             best_event = event_id
+            best_name = name
             best_loc = np.where(res >= EVENT_THRESHOLD)
 
     if best_event is None or best_score < EVENT_THRESHOLD:
-        return None, None
+        return None, None, best_score, best_name
 
-    return best_event, best_loc
+    return best_event, best_loc, best_score, best_name
 
 
 def detect_team(events_bgr, loc):
@@ -565,86 +528,183 @@ def detect_team(events_bgr, loc):
     return team
 
 
+def get_objective_payload(team, event_id):
+    if team != 1:
+        return None, []
+
+    if event_id == 0:
+        return "Baron", [(3, (255, 0, 255)), (4, (255, 0, 255))]
+    if event_id == 1:
+        return "Rift", [(2, (255, 0, 255))]
+    if event_id == 2:
+        return "Cloud", [(1, (255, 255, 255))]
+    if event_id == 3:
+        return "Infernal", [(1, (255, 10, 0))]
+    if event_id == 4:
+        return "Mountain", [(1, (255, 150, 0))]
+    if event_id == 5:
+        return "Ocean", [(1, (0, 150, 255))]
+    if event_id == 6:
+        return "Elder", [(3, (255, 150, 255)), (4, (255, 150, 255))]
+
+    return None, []
+
+
+def send_objective(arduino, team, event_id):
+    name, payload = get_objective_payload(team, event_id)
+    if not payload:
+        return name
+
+    for opcode, rgb in payload:
+        send_color_cmd(arduino, opcode, rgb)
+
+    return name
+
+
+# ================= MODE INPUT =================
+
+def pump_mode_messages(arduino, show_mana: bool) -> bool:
+    if arduino is None:
+        return show_mana
+
+    # read any full lines sitting in the buffer
+    while True:
+        try:
+            if arduino.in_waiting <= 0:
+                break
+            line = arduino.readline().decode(errors="ignore").strip()
+        except Exception:
+            break
+
+        if not line:
+            break
+
+        if line == "MODE:MANA":
+            show_mana = True
+            print(">> MODE set to MANA")
+        elif line == "MODE:HP":
+            show_mana = False
+            print(">> MODE set to HP")
+
+    return show_mana
+
+
+# ================= MAIN =================
+
 def main():
     monitor_index, events_crop, health_crop, mana_crop = load_crop_config()
 
     arduino = safe_serial_open()
     templates = load_templates()
 
-    currentEvent = [-1, -1]
-    lastEvent = [-1, -1]
-    lastEventTime = 0.0
+    show_mana = False
 
+    # objective state
+    last_event = [-1, -1]
+    last_event_time = 0.0
+    active_obj_name = None
+    active_obj_team = -1
+    active_obj_event_id = -1
+    active_obj_until = 0.0
+    last_obj_send_time = 0.0
+    last_obj_print_time = 0.0
+
+    # HP state
     good_hp = [0, 0]
-    good_hp_permille = 500
-    smooth_hp_permille = 500
+    hp_permille = 500
+    hp_smooth = 500
+    hp_max_candidate = None
+    hp_max_hits = 0
+    hp_ocr_lock_until = 0.0
+    hp_bad_since = None
     was_dead = False
     dead_confirm = 0
     alive_confirm = 0
     full_confirm = 0
+    hp_last_rgb = None
 
+    # Mana state
     good_mana = [0, 0]
-    good_mana_permille = 500
-    smooth_mana_permille = 500
+    mana_permille = 500
+    mana_smooth = 500
+    mana_max_candidate = None
+    mana_max_hits = 0
+    mana_lock_until = 0.0
+    mana_bad_since = None
+    mana_dead_now = False
+    mana_alive_confirm = 0
+    revive_blue_until = 0.0
+    last_stable_mana_rgb = None
 
-    objective_hold_until = 0.0
-
-    max_candidate = None
-    max_candidate_hits = 0
-    max_mana_candidate = None
-    max_mana_candidate_hits = 0
+    # send throttling
+    last_sent_rgb = None
+    last_send_time = 0.0
 
     last_debug_time = 0.0
-    last_debug_tuple = None
-
-    hp_ocr_lock_until = 0.0
-    hp_ocr_bad_since = None
-
-    mana_ocr_lock_until = 0.0
-    mana_ocr_bad_since = None
-
-    output_mode = START_OUTPUT_MODE
-    serial_buf = ""
-    last_output_rgb = None
-    last_sent_rgb = None
-
-    objective_pulse_request_until = 0.0
-    objective_anim_until = 0.0
 
     with mss.mss() as sct:
         while True:
             now = time.monotonic()
-
-            serial_buf, lines = read_arduino_lines(arduino, serial_buf)
-            for line in lines:
-                if line.strip().upper() == "TOGGLE":
-                    output_mode = "mana" if output_mode == "hp" else "hp"
-                    print("OUTPUT MODE:", output_mode.upper())
+            show_mana = pump_mode_messages(arduino, show_mana)
 
             monitor = sct.monitors[monitor_index]
 
+            # ========= EVENTS =========
             events_region = build_region(monitor, events_crop)
             events_bgra = np.array(sct.grab(events_region))
             events_bgr = bgra_to_bgr(events_bgra)
             events_gray = bgr_to_gray(events_bgr)
 
-            health_region = build_region(monitor, health_crop)
-            health_bgra = np.array(sct.grab(health_region))
-            health_bw = prep_bar_for_ocr(health_bgra, HEALTH_FOCUS_X, HEALTH_FOCUS_Y)
-            health_txt = ocr_bar_text(health_bw)
+            event_id, loc, event_score, event_name = detect_event(events_gray, templates)
 
-            mana_region = build_region(monitor, mana_crop)
-            mana_bgra = np.array(sct.grab(mana_region))
-            mana_bw = prep_bar_for_ocr(mana_bgra, MANA_FOCUS_X, MANA_FOCUS_Y)
-            mana_txt = ocr_bar_text(mana_bw)
+            current_event = [-1, -1]
+            if event_id is not None:
+                current_event[1] = event_id
+                team = detect_team(events_bgr, loc)
+                current_event[0] = team if team is not None else -1
+
+            team_changed = int(current_event[0]) != int(last_event[0])
+            event_changed = int(current_event[1]) != int(last_event[1])
+            timed_out = (now - last_event_time) > 3.0
+
+            if (team_changed or timed_out) and event_changed and int(current_event[1]) != -1:
+                obj_name = send_objective(arduino, int(current_event[0]), int(current_event[1]))
+
+                if obj_name is not None:
+                    active_obj_name = obj_name
+                    active_obj_team = int(current_event[0])
+                    active_obj_event_id = int(current_event[1])
+                    active_obj_until = now + OBJECTIVE_PULSE_SEC
+                    last_obj_send_time = 0.0
+                    last_obj_print_time = 0.0
+
+                    print(
+                        "OBJECTIVE TRIGGERED:",
+                        obj_name,
+                        "team",
+                        active_obj_team,
+                        "score",
+                        round(float(event_score), 3),
+                        "pulseSec",
+                        OBJECTIVE_PULSE_SEC,
+                    )
+
+                last_event = copy.deepcopy(current_event)
+                last_event_time = now
+
+            # ========= HP OCR =========
+            hp_region = build_region(monitor, health_crop)
+            hp_bgra = np.array(sct.grab(hp_region))
+            hp_bw = prep_bar_for_ocr(hp_bgra, HEALTH_FOCUS_X, HEALTH_FOCUS_Y)
+            hp_txt = ocr_bar_text(hp_bw)
 
             hp_frame_ok = False
             hp_glitch = False
 
-            if is_ocr_glitch(health_txt):
+            if is_ocr_glitch(hp_txt):
                 hp_glitch = True
             else:
-                parsed = parse_hp_flexible(health_txt, good_hp[1])
+                parsed = parse_pair_flexible(hp_txt, good_hp[1])
                 if parsed is None:
                     hp_glitch = True
                 else:
@@ -659,40 +719,41 @@ def main():
                             cur = fixed
 
                     if not hp_glitch:
-                        ok, cur, mx, max_candidate, max_candidate_hits = accept_reading(
-                            cur, mx, good_hp, strong, max_candidate, max_candidate_hits
+                        ok, cur, mx, hp_max_candidate, hp_max_hits = accept_reading(
+                            cur, mx, good_hp, strong, hp_max_candidate, hp_max_hits
                         )
-
                         if ok and mx > 0 and 0 <= cur <= mx:
                             good_hp[0] = cur
                             good_hp[1] = mx
-                            good_hp_permille = int(cur * 1000 / mx)
-
-                            if strong and mx > 0 and cur == 0:
-                                dead_confirm += 1
-                                alive_confirm = 0
-                            elif mx > 0 and cur > 0:
-                                alive_confirm += 1
-                                dead_confirm = 0
-                            else:
-                                dead_confirm = 0
-                                alive_confirm = 0
-
-                            if strong and mx > 0 and good_hp_permille >= FULL_SNAP_PERMILLE:
-                                full_confirm += 1
-                            else:
-                                full_confirm = 0
-
+                            hp_permille = int(cur * 1000 / mx)
                             hp_frame_ok = True
                         else:
                             hp_glitch = True
 
             if not hp_frame_ok:
-                hp_ocr_lock_until = max(hp_ocr_lock_until, now + OCR_GLITCH_HOLD_SEC)
-                if hp_ocr_bad_since is None:
-                    hp_ocr_bad_since = now
+                hp_ocr_lock_until = max(hp_ocr_lock_until, now + HP_OCR_GLITCH_HOLD_SEC)
+                if hp_bad_since is None:
+                    hp_bad_since = now
             else:
-                hp_ocr_bad_since = None
+                hp_bad_since = None
+
+            if hp_frame_ok:
+                cur, mx = good_hp
+                strong = True if ("/" in hp_txt) else False
+                if strong and mx > 0 and cur == 0:
+                    dead_confirm += 1
+                    alive_confirm = 0
+                elif mx > 0 and cur > 0:
+                    alive_confirm += 1
+                    dead_confirm = 0
+                else:
+                    dead_confirm = 0
+                    alive_confirm = 0
+
+                if strong and mx > 0 and hp_permille >= FULL_SNAP_PERMILLE:
+                    full_confirm += 1
+                else:
+                    full_confirm = 0
 
             dead_now = was_dead
             if dead_confirm >= DEAD_FRAMES_REQUIRED:
@@ -701,8 +762,26 @@ def main():
                 dead_now = False
             was_dead = dead_now
 
-            smooth_hp_permille = int((smooth_hp_permille * 6 + good_hp_permille * 4) / 10)
-            smooth_hp_permille = quantize_permille(smooth_hp_permille, COLOR_STEP_PERMILLE)
+            hp_smooth = int((hp_smooth * 6 + hp_permille * 4) / 10)
+            hp_smooth = quantize_permille(hp_smooth, COLOR_STEP_PERMILLE)
+
+            hp_rgb = hp_color_from_permille(hp_smooth, dead_now)
+            if (not dead_now) and (full_confirm >= FULL_FRAMES_REQUIRED):
+                hp_rgb = (0, 255, 0)
+
+            if now < hp_ocr_lock_until:
+                hp_rgb = hp_last_rgb if hp_last_rgb is not None else FALLBACK_YELLOW_RGB
+
+            if hp_bad_since is not None and (now - hp_bad_since) >= HP_OCR_FALLBACK_YELLOW_AFTER_SEC:
+                hp_rgb = FALLBACK_YELLOW_RGB
+
+            hp_last_rgb = hp_rgb
+
+            # ========= MANA OCR =========
+            mana_region = build_region(monitor, mana_crop)
+            mana_bgra = np.array(sct.grab(mana_region))
+            mana_bw = prep_bar_for_ocr(mana_bgra, MANA_FOCUS_X, MANA_FOCUS_Y)
+            mana_txt = ocr_bar_text(mana_bw)
 
             mana_frame_ok = False
             mana_glitch = False
@@ -710,7 +789,7 @@ def main():
             if is_ocr_glitch(mana_txt):
                 mana_glitch = True
             else:
-                parsed = parse_hp_flexible(mana_txt, good_mana[1])
+                parsed = parse_pair_flexible(mana_txt, good_mana[1])
                 if parsed is None:
                     mana_glitch = True
                 else:
@@ -725,183 +804,105 @@ def main():
                             cur = fixed
 
                     if not mana_glitch:
-                        ok, cur, mx, max_mana_candidate, max_mana_candidate_hits = accept_reading(
-                            cur, mx, good_mana, strong, max_mana_candidate, max_mana_candidate_hits
+                        ok, cur, mx, mana_max_candidate, mana_max_hits = accept_reading(
+                            cur, mx, good_mana, strong, mana_max_candidate, mana_max_hits
                         )
-
                         if ok and mx > 0 and 0 <= cur <= mx:
                             good_mana[0] = cur
                             good_mana[1] = mx
-                            good_mana_permille = int(cur * 1000 / mx)
+                            mana_permille = int(cur * 1000 / mx)
                             mana_frame_ok = True
                         else:
                             mana_glitch = True
 
             if not mana_frame_ok:
-                mana_ocr_lock_until = max(mana_ocr_lock_until, now + OCR_GLITCH_HOLD_SEC)
-                if mana_ocr_bad_since is None:
-                    mana_ocr_bad_since = now
+                mana_lock_until = max(mana_lock_until, now + MANA_OCR_GLITCH_HOLD_SEC)
+                if mana_bad_since is None:
+                    mana_bad_since = now
             else:
-                mana_ocr_bad_since = None
+                mana_bad_since = None
 
-            smooth_mana_permille = int((smooth_mana_permille * 6 + good_mana_permille * 4) / 10)
-            smooth_mana_permille = quantize_permille(smooth_mana_permille, COLOR_STEP_PERMILLE)
+            mana_smooth = int((mana_smooth * 6 + mana_permille * 4) / 10)
+            mana_smooth = quantize_permille(mana_smooth, COLOR_STEP_PERMILLE)
 
-            hp_rgb = health_color_from_permille(smooth_hp_permille, dead_now)
-            mana_rgb = mana_gradient_from_permille(smooth_mana_permille)
+            mana_rgb = quantize_rgb(mana_gradient_from_permille(mana_smooth), RGB_STEP)
 
-            if output_mode == "hp":
-                selected_rgb = hp_rgb
-                any_lock = now < hp_ocr_lock_until
-                bad_since = hp_ocr_bad_since
-            else:
-                selected_rgb = mana_rgb
-                any_lock = now < mana_ocr_lock_until
-                bad_since = mana_ocr_bad_since
+            mana_out = mana_rgb
 
-            if any_lock:
-                selected_rgb = last_output_rgb if last_output_rgb is not None else FALLBACK_YELLOW_RGB
+            if now < mana_lock_until:
+                mana_out = last_stable_mana_rgb if last_stable_mana_rgb is not None else FALLBACK_YELLOW_RGB
 
-            long_bad = (bad_since is not None) and ((now - bad_since) >= OCR_FALLBACK_YELLOW_AFTER_SEC)
-            if long_bad:
-                selected_rgb = FALLBACK_YELLOW_RGB
+            if mana_bad_since is not None and (now - mana_bad_since) >= MANA_DEAD_DETECT_AFTER_SEC:
+                mana_dead_now = True
 
-            if dead_now:
-                selected_rgb = (255, 0, 0)
+            if mana_dead_now:
+                mana_out = last_stable_mana_rgb if last_stable_mana_rgb is not None else FALLBACK_YELLOW_RGB
 
-            if output_mode == "hp" and full_confirm >= FULL_FRAMES_REQUIRED:
-                selected_rgb = (0, 255, 0)
+                if mana_frame_ok:
+                    mana_alive_confirm += 1
+                else:
+                    mana_alive_confirm = 0
 
-            final_rgb = quantize_rgb(selected_rgb, RGB_STEP)
+                if mana_alive_confirm >= MANA_ALIVE_FRAMES_REQUIRED:
+                    mana_dead_now = False
+                    mana_alive_confirm = 0
+                    revive_blue_until = now + MANA_REVIVE_FORCE_BLUE_SEC
 
-            if (not any_lock) and (not long_bad):
-                last_output_rgb = final_rgb
+            if not mana_dead_now:
+                last_stable_mana_rgb = mana_out
 
-            if now < objective_anim_until:
-                pass
-            else:
-                if output_mode == "mana" and now < objective_pulse_request_until and ENABLE_SERIAL and arduino is not None:
-                    send_color_cmd(arduino, CMD_OBJECTIVE_PULSE, OBJECTIVE_PULSE_RGB)
-                    objective_anim_until = now + OBJECTIVE_PULSE_SEC
-                    objective_pulse_request_until = 0.0
+            if (not mana_dead_now) and (now < revive_blue_until):
+                mana_out = quantize_rgb(MANA_GRADIENT_LOW_RGB, RGB_STEP)
 
-                if ENABLE_SERIAL and arduino is not None:
-                    if final_rgb != last_sent_rgb:
-                        send_color_cmd(arduino, CMD_STILL, final_rgb)
-                        last_sent_rgb = final_rgb
+            # ========= OUTPUT SELECTION =========
+            base_rgb = mana_out if show_mana else hp_rgb
+            mode_name = "MANA" if show_mana else "HP"
 
-            if PRINT_OCR_DEBUG:
-                hp_lock_left = round(max(0.0, hp_ocr_lock_until - now), 2)
-                mana_lock_left = round(max(0.0, mana_ocr_lock_until - now), 2)
+            # Objective pulse overrides base output
+            if active_obj_name is not None and now < active_obj_until:
+                if arduino is not None and (now - last_obj_send_time) >= SEND_EVERY_SEC:
+                    send_objective(arduino, active_obj_team, active_obj_event_id)
+                    last_obj_send_time = now
 
-                debug_tuple = (
-                    output_mode,
-                    health_txt,
-                    good_hp[0],
-                    good_hp[1],
-                    good_hp_permille,
-                    smooth_hp_permille,
-                    dead_now,
-                    hp_rgb,
-                    hp_glitch,
-                    hp_lock_left,
-                    mana_txt,
-                    good_mana[0],
-                    good_mana[1],
-                    good_mana_permille,
-                    smooth_mana_permille,
-                    mana_rgb,
-                    mana_glitch,
-                    mana_lock_left,
-                    final_rgb,
+                if (now - last_obj_print_time) >= OBJECTIVE_PRINT_EVERY_SEC:
+                    left = round(max(0.0, active_obj_until - now), 2)
+                    print("OBJECTIVE PULSE:", active_obj_name, "leftSec", left)
+                    last_obj_print_time = now
+
+            elif active_obj_name is not None and now >= active_obj_until:
+                print("OBJECTIVE END:", active_obj_name)
+                active_obj_name = None
+                active_obj_team = -1
+                active_obj_event_id = -1
+                last_sent_rgb = None
+
+            # Normal send only when no objective pulse
+            if active_obj_name is None:
+                if arduino is not None and (now - last_send_time) >= SEND_EVERY_SEC:
+                    if base_rgb != last_sent_rgb:
+                        send_still_color(arduino, base_rgb)
+                        last_sent_rgb = base_rgb
+                        last_send_time = now
+
+            # ========= DEBUG =========
+            if PRINT_DEBUG and (now - last_debug_time) >= DEBUG_PRINT_EVERY_SEC:
+                print(
+                    f"MODE {mode_name} | "
+                    f"HP [{hp_txt}] {good_hp[0]}/{good_hp[1]} perm {hp_permille} smooth {hp_smooth} rgb {hp_rgb} | "
+                    f"MANA [{mana_txt}] {good_mana[0]}/{good_mana[1]} perm {mana_permille} smooth {mana_smooth} rgb {mana_out} | "
+                    f"OUT {base_rgb}"
                 )
-
-                if (now - last_debug_time) >= DEBUG_PRINT_EVERY_SEC and debug_tuple != last_debug_tuple:
-                    print(
-                        "MODE:",
-                        output_mode.upper(),
-                        "|",
-                        "HP:",
-                        f"[{health_txt}]",
-                        f"{good_hp[0]}/{good_hp[1]}",
-                        "perm",
-                        good_hp_permille,
-                        "smooth",
-                        smooth_hp_permille,
-                        "dead",
-                        dead_now,
-                        "rgb",
-                        hp_rgb,
-                        "glitch",
-                        hp_glitch,
-                        "lock",
-                        hp_lock_left,
-                        "|",
-                        "MANA:",
-                        f"[{mana_txt}]",
-                        f"{good_mana[0]}/{good_mana[1]}",
-                        "perm",
-                        good_mana_permille,
-                        "smooth",
-                        smooth_mana_permille,
-                        "rgb",
-                        mana_rgb,
-                        "glitch",
-                        mana_glitch,
-                        "lock",
-                        mana_lock_left,
-                        "|",
-                        "OUT:",
-                        final_rgb,
-                    )
-                    last_debug_time = now
-                    last_debug_tuple = debug_tuple
-
-            event_id, loc = detect_event(events_gray, templates)
-
-            if event_id is not None:
-                currentEvent[1] = event_id
-                currentEvent[0] = detect_team(events_bgr, loc)
-            else:
-                currentEvent[0] = -1
-                currentEvent[1] = -1
-
-            team_changed = int(currentEvent[0]) != int(lastEvent[0])
-            event_changed = int(currentEvent[1]) != int(lastEvent[1])
-            timed_out = (now - lastEventTime) > 3.0
-
-            if (team_changed or timed_out) and event_changed and int(currentEvent[1]) != -1:
-                if currentEvent[0] == 1:
-                    if currentEvent[1] == 0:
-                        print("Baron")
-                    elif currentEvent[1] == 1:
-                        print("Rift")
-                    elif currentEvent[1] == 2:
-                        print("Cloud")
-                    elif currentEvent[1] == 3:
-                        print("Infernal")
-                    elif currentEvent[1] == 4:
-                        print("Mountain")
-                    elif currentEvent[1] == 5:
-                        print("Ocean")
-                    elif currentEvent[1] == 6:
-                        print("Elder")
-
-                lastEvent = copy.deepcopy(currentEvent)
-                lastEventTime = now
-                objective_hold_until = now + OBJECTIVE_HOLD_SEC
-                objective_pulse_request_until = now + 2.5
+                last_debug_time = now
 
             if SHOW_DEBUG_WINDOWS:
                 cv2.imshow("Events Debug", events_bgr)
-                cv2.imshow("Health Crop RAW", bgra_to_bgr(health_bgra))
-                cv2.imshow("Health OCR Input", health_bw)
-                cv2.imshow("Mana Crop RAW", bgra_to_bgr(mana_bgra))
+                cv2.imshow("HP OCR Input", hp_bw)
                 cv2.imshow("Mana OCR Input", mana_bw)
-
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord("q") or key == 27:
                     break
+
+            time.sleep(0.01)
 
     cv2.destroyAllWindows()
 
