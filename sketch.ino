@@ -1,209 +1,142 @@
-// *By: Ahmed Amgad :: http://ax2mproductions.com :: https://github.com/ax2mazhr/LOLed *
+// Arduino Uno sketch for HP/Mana LED display with button toggle
+// Pins: Red=9, Blue=5, Green=6, Button=2
+// Serial: 115200
+// Protocol:
+//   H:<cur>,<max>\n   -> update HP values
+//   M:<cur>,<max>\n   -> update Mana values
+//   E:drake\n        -> flash event (if sent)
 
-#include <FastLED.h>
-#define redPin 9
-#define greenPin 6
-#define bluePin 5
+#include <Arduino.h>
+const int pinR = 9;
+const int pinG = 6;
+const int pinB = 5;
+const int buttonPin = 2;
 
-#define LED_PIN     7
-#define NUM_LEDS    70
-CRGB leds[NUM_LEDS];
+int mode = 0;
+int hp = 0, hpMax = 100;
+int mana = 0, manaMax = 100;
 
-// ===== BUTTON =====
-#define BUTTON_PIN 2
-#define DEBOUNCE_MS 180
+unsigned long lastDebounce = 0;
+int lastButtonState = HIGH;
+int buttonState = HIGH;
+const unsigned long debounceDelay = 50;
 
-bool showMana = false;
-bool lastButtonState = HIGH;
-unsigned long lastButtonTime = 0;
-
-// ==================
+unsigned long lastFlashUntil = 0;
+bool flashing = false;
 
 void setup() {
-  pinMode(redPin, OUTPUT);
-  pinMode(greenPin, OUTPUT);
-  pinMode(bluePin, OUTPUT);
+  Serial.begin(115200);
+  pinMode(pinR, OUTPUT);
+  pinMode(pinG, OUTPUT);
+  pinMode(pinB, OUTPUT);
+  pinMode(buttonPin, INPUT_PULLUP);
 
-  pinMode(BUTTON_PIN, INPUT_PULLUP);
-
-  digitalWrite(redPin, HIGH);
-  digitalWrite(greenPin, HIGH);
-  digitalWrite(bluePin, HIGH);
-
-  FastLED.addLeds<WS2812, LED_PIN, GRB>(leds, NUM_LEDS);
-
-  for (int i = 0; i < NUM_LEDS; i++) {
-    leds[i] = CRGB(0, 0, 255);
-    FastLED.show();
-    delay(20);
-  }
-
-  delay(1000);
-  reset();
-
-  Serial.begin(9600);
-
-  // Initial mode feedback
-  Serial.println("MODE:HP");
+  analogWrite(pinR, 0);
+  analogWrite(pinG, 0);
+  analogWrite(pinB, 0);
 }
 
 void loop() {
-  handleButton();
+  while (Serial.available()) {
+    String line = Serial.readStringUntil('\n');
+    line.trim();
+    if (line.length() == 0) continue;
+    parseLine(line);
+  }
 
-  if (Serial.available()) {
-    int cmd = Serial.parseInt();
+  int reading = digitalRead(buttonPin);
+  if (reading != lastButtonState) {
+    lastDebounce = millis();
+  }
+  if ((millis() - lastDebounce) > debounceDelay) {
+    if (reading != buttonState) {
+      buttonState = reading;
+      if (buttonState == LOW) {
+        mode = 1 - mode;
+      }
+    }
+  }
+  lastButtonState = reading;
 
-    if (cmd == 10) {
-      still();
+  if (flashing) {
+    if (millis() < lastFlashUntil) {
+      analogWrite(pinR, 255);
+      analogWrite(pinG, 255);
+      analogWrite(pinB, 255);
+      return;
+    } else {
+      flashing = false;
     }
-    else if (cmd == 1) {
-      fadeD();
+  }
+
+  if (mode == 0) {
+    int g = 0;
+    if (hpMax > 0) g = map(constrain(hp, 0, hpMax), 0, hpMax, 0, 255);
+    analogWrite(pinR, 0);
+    analogWrite(pinG, g);
+    analogWrite(pinB, 0);
+  } else {
+    int b = 0;
+    if (manaMax > 0) b = map(constrain(mana, 0, manaMax), 0, manaMax, 0, 255);
+    analogWrite(pinR, 0);
+    analogWrite(pinG, 0);
+    analogWrite(pinB, b);
+  }
+}
+
+void parseLine(String s) {
+  s.trim();
+  if (s.length() < 2) return;
+  char t = s.charAt(0);
+  if (t == 'H') {
+    int colon = s.indexOf(':');
+    int comma = s.indexOf(',');
+    if (colon >= 0 && comma > colon) {
+      String a = s.substring(colon + 1, comma);
+      String b = s.substring(comma + 1);
+      hp = a.toInt();
+      hpMax = b.toInt();
     }
-    else if (cmd == 2) {
-      fadeF();
+  } else if (t == 'M') {
+    int colon = s.indexOf(':');
+    int comma = s.indexOf(',');
+    if (colon >= 0 && comma > colon) {
+      String a = s.substring(colon + 1, comma);
+      String b = s.substring(comma + 1);
+      mana = a.toInt();
+      manaMax = b.toInt();
     }
-    else if (cmd == 3) {
-      fadeOn();
+  } else if (t == 'E') {
+    int colon = s.indexOf(':');
+    String ev = (colon >= 0) ? s.substring(colon + 1) : s.substring(1);
+    ev.trim();
+    if (ev == "drake") {
+      flashWhite();
     }
-    else if (cmd == 4) {
-      glow();
+  } else {
+    int comma1 = s.indexOf(',');
+    int comma2 = s.indexOf(',', comma1 + 1);
+    int comma3 = s.indexOf(',', comma2 + 1);
+    if (comma1 > 0 && comma2 > comma1 && comma3 > comma2) {
+      int opcode = s.substring(0, comma1).toInt();
+      int r = s.substring(comma1 + 1, comma2).toInt();
+      int g = s.substring(comma2 + 1, comma3).toInt();
+      int dot = s.indexOf('.', comma3 + 1);
+      int b = 0;
+      if (dot > comma3) {
+        b = s.substring(comma3 + 1, dot).toInt();
+      } else {
+        b = s.substring(comma3 + 1).toInt();
+      }
+      analogWrite(pinR, r);
+      analogWrite(pinG, g);
+      analogWrite(pinB, b);
+      delay(350);
     }
   }
 }
 
-// ================= BUTTON LOGIC =================
-
-void handleButton() {
-  bool state = digitalRead(BUTTON_PIN);
-
-  if (state == LOW && lastButtonState == HIGH) {
-    unsigned long now = millis();
-    if (now - lastButtonTime > DEBOUNCE_MS) {
-      showMana = !showMana;
-      lastButtonTime = now;
-
-      Serial.print("MODE:");
-      Serial.println(showMana ? "MANA" : "HP");
-    }
-  }
-
-  lastButtonState = state;
-}
-
-// ================= LED FUNCTIONS =================
-
-void still() {
-  int Rval = Serial.parseInt();
-  int Gval = Serial.parseInt();
-  int Bval = Serial.parseInt();
-
-  fill_solid(leds, NUM_LEDS, CRGB(Rval, Gval, Bval));
-  FastLED.show();
-
-  analogWrite(redPin, Rval);
-  analogWrite(greenPin, Gval);
-  analogWrite(bluePin, Bval);
-}
-
-void reset() {
-  analogWrite(redPin, 0);
-  analogWrite(greenPin, 0);
-  analogWrite(bluePin, 0);
-  FastLED.clear();
-  FastLED.show();
-}
-
-void fadeD() {
-  double i = double(Serial.parseInt()) / 255;
-  double j = double(Serial.parseInt()) / 255;
-  double k = double(Serial.parseInt()) / 255;
-
-  for (double c = 0; c < 255; c++) {
-    analogWrite(redPin, c * i);
-    analogWrite(greenPin, j * c);
-    analogWrite(bluePin, k * c);
-    fill_solid(leds, NUM_LEDS, CRGB(c * i, c * j, c * k));
-    FastLED.show();
-    delay(1);
-  }
-
-  delay(500);
-
-  for (double c = 255; c > 0; c--) {
-    analogWrite(redPin, i * c);
-    analogWrite(greenPin, j * c);
-    analogWrite(bluePin, k * c);
-    fill_solid(leds, NUM_LEDS, CRGB(c * i, c * j, c * k));
-    FastLED.show();
-    delay(10);
-  }
-}
-
-void fadeOn() {
-  double i = double(Serial.parseInt()) / 255;
-  double j = double(Serial.parseInt()) / 255;
-  double k = double(Serial.parseInt()) / 255;
-
-  for (double c = 0; c < 255; c++) {
-    analogWrite(redPin, c * i);
-    analogWrite(greenPin, j * c);
-    analogWrite(bluePin, k * c);
-    fill_solid(leds, NUM_LEDS, CRGB(c * i, c * j, c * k));
-    FastLED.show();
-    delay(5);
-  }
-}
-
-void fadeF() {
-  double i = double(Serial.parseInt()) / 255;
-  double j = double(Serial.parseInt()) / 255;
-  double k = double(Serial.parseInt()) / 255;
-
-  for (double c = 0; c < 255; c++) {
-    analogWrite(redPin, c * i);
-    analogWrite(greenPin, j * c);
-    analogWrite(bluePin, k * c);
-    fill_solid(leds, NUM_LEDS, CRGB(c * i, c * j, c * k));
-    FastLED.show();
-    delay(1);
-  }
-
-  delay(100);
-
-  for (double c = 255; c > 0; c--) {
-    analogWrite(redPin, i * c);
-    analogWrite(greenPin, j * c);
-    analogWrite(bluePin, k * c);
-    fill_solid(leds, NUM_LEDS, CRGB(c * i, c * j, c * k));
-    FastLED.show();
-    delay(1);
-  }
-
-  reset();
-}
-
-void glow() {
-  double i = double(Serial.parseInt()) / 255;
-  double j = double(Serial.parseInt()) / 255;
-  double k = double(Serial.parseInt()) / 255;
-
-  while (Serial.available() < 3) {
-    for (double c = 255; c > 55; c--) {
-      analogWrite(redPin, i * c);
-      analogWrite(greenPin, j * c);
-      analogWrite(bluePin, k * c);
-      fill_solid(leds, NUM_LEDS, CRGB(c * i, c * j, c * k));
-      FastLED.show();
-      delay(5);
-    }
-
-    for (double c = 55; c < 255; c++) {
-      analogWrite(redPin, c * i);
-      analogWrite(greenPin, j * c);
-      analogWrite(bluePin, k * c);
-      fill_solid(leds, NUM_LEDS, CRGB(c * i, c * j, c * k));
-      FastLED.show();
-      delay(5);
-    }
-  }
+void flashWhite() {
+  flashing = true;
+  lastFlashUntil = millis() + 450;
 }

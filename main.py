@@ -27,7 +27,7 @@ AUTO_DETECT_SERIAL = True
 
 # ================= OCR CONFIG =================
 
-TESSERACT_EXE = r"C:\Program Files\Tesseract-OCR\tesseract.exe"
+TESSERACT_EXE = r"C:\Users\tjfle\AppData\Local\Programs\Tesseract-OCR\tesseract.exe"
 if not Path(TESSERACT_EXE).exists():
     raise RuntimeError("Tesseract exe not found at: " + TESSERACT_EXE)
 
@@ -45,10 +45,9 @@ THIN_ITERATIONS = 1
 CONFIG_PATH = Path("crops.json")
 MONITOR_INDEX = 1
 
-EVENTS_CROP = {"top": 233, "left": 1760, "width": 150, "height": 102}
-HEALTH_CROP = {"top": 984, "left": 775, "width": 280, "height": 27}
-MANA_CROP = {"top": 996, "left": 775, "width": 280, "height": 27}
-
+EVENTS_CROP = {"top": 233, "left": 1550, "width": 160, "height": 292}
+HEALTH_CROP = {"top": 1000, "left": 606, "width": 350, "height": 30 }
+MANA_CROP = {"top": 1017, "left": 610, "width": 345, "height": 30 }
 HEALTH_FOCUS_X = (0.40, 0.62)
 HEALTH_FOCUS_Y = (0.32, 0.78)
 MANA_FOCUS_X = (0.40, 0.62)
@@ -86,8 +85,8 @@ MANA_REVIVE_FORCE_BLUE_SEC = 1.00
 MANA_ALIVE_FRAMES_REQUIRED = 2
 
 RGB_STEP = 5
-MANA_GRADIENT_LOW_RGB = (20, 40, 255)
-MANA_GRADIENT_HIGH_RGB = (170, 30, 200)
+MANA_GRADIENT_LOW_RGB = (0, 255, 255)
+MANA_GRADIENT_HIGH_RGB = (0, 0, 255)
 
 # Objective detection
 EVENT_THRESHOLD = 0.8
@@ -95,13 +94,16 @@ OBJECTIVE_PULSE_SEC = 2.0
 OBJECTIVE_PRINT_EVERY_SEC = 0.25
 
 TEMPLATES = {
-    0: ("Baron", "template/baron.jpg"),
-    1: ("Rift", "template/rift.jpg"),
-    2: ("Cloud", "template/cloud.jpg"),
+    0: ("Baron", "template/baron.png"),
+    1: ("Rift", "template/rift.png"),
+    2: ("Cloud", "template/cloud.png"),
     3: ("Infernal", "template/infernal.png"),
-    4: ("Mountain", "template/mountain.jpg"),
-    5: ("Ocean", "template/ocean.jpg"),
-    6: ("Elder", "template/elder.jpg"),
+    4: ("Mountain", "template/mountain.png"),
+    5: ("Ocean", "template/ocean.png"),
+    6: ("Elder", "template/elder.png"),
+    7: ("Chem", "template/chem.png"),
+    8: ("Hex", "template/hex.png"),
+
 }
 
 
@@ -546,7 +548,10 @@ def get_objective_payload(team, event_id):
         return "Ocean", [(1, (0, 150, 255))]
     if event_id == 6:
         return "Elder", [(3, (255, 150, 255)), (4, (255, 150, 255))]
-
+    if event_id == 7:
+        return "Chem", [(1, (0, 255, 0))]
+    if event_id == 8:
+        return "Hex", [(1, (255, 255, 0))]
     return None, []
 
 
