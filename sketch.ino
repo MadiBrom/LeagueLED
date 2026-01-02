@@ -1,11 +1,3 @@
-// Arduino Uno sketch for HP/Mana LED display with button toggle
-// Pins: Red=9, Blue=5, Green=6, Button=2
-// Serial: 115200
-// Protocol:
-//   H:<cur>,<max>\n   -> update HP values
-//   M:<cur>,<max>\n   -> update Mana values
-//   E:drake\n        -> flash event (if sent)
-
 #include <Arduino.h>
 const int pinR = 9;
 const int pinG = 6;
